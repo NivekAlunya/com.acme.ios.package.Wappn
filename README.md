@@ -1,2 +1,2 @@
-# com.acme.ios.package.Logger
+# com.acme.ios.package.Wappn
 Log and crash interceptor
