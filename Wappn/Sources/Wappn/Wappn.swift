@@ -1,6 +1,7 @@
 import Foundation
 
 // MARK: - Crash Info
+/// Represents detailed information about a crash event.
 public struct CrashInfo: Codable, Sendable {
     public let timestamp: Date
     public let reason: String
@@ -25,6 +26,9 @@ public struct CrashInfo: Codable, Sendable {
 }
 
 // MARK: - Wappn
+/// The main class for the Wappn package, handling crash detection and log interception.
+///
+/// Use `Wappn.shared` to access the singleton instance.
 public final class Wappn: @unchecked Sendable {
     public static let shared = Wappn()
     
@@ -41,6 +45,10 @@ public final class Wappn: @unchecked Sendable {
     private let lastCrashKey = "com.wappn.lastCrashInfo"
     
     // Crash handler callback
+    /// Callback triggered when a crash occurs.
+    ///
+    /// This closure is called just before the app terminates due to a crash.
+    /// You can use this to save critical data, but keep the operation short.
     public var onCrash: (@Sendable (CrashInfo) -> Void)?
     
     private init() {
@@ -90,6 +98,9 @@ public final class Wappn: @unchecked Sendable {
         clearCrashMarker()
     }
     
+    /// Starts intercepting standard output and monitoring for crashes.
+    ///
+    /// - Parameter interceptCrashes: If `true`, sets up handlers for uncaught exceptions and fatal signals.
     public func startIntercepting(interceptCrashes: Bool = true) {
         guard !isIntercepting else { return }
         
@@ -119,6 +130,7 @@ public final class Wappn: @unchecked Sendable {
         }
     }
     
+    /// Stops intercepting standard output and restores the original stdout.
     public func stopIntercepting() {
         guard isIntercepting else { return }
         
@@ -130,18 +142,26 @@ public final class Wappn: @unchecked Sendable {
         isIntercepting = false
     }
     
+    /// Returns all captured output strings.
+    ///
+    /// - Returns: An array of strings captured from stdout.
     public func getCapturedOutput() -> [String] {
         return queue.sync {
             return capturedOutput
         }
     }
     
+    /// Returns the crash info if a crash has been detected in the current session.
+    ///
+    /// This is typically populated just before the app terminates.
+    /// - Returns: `CrashInfo` if a crash occurred, otherwise `nil`.
     public func getCrashInfo() -> CrashInfo? {
         return queue.sync {
             return crashInfo
         }
     }
     
+    /// Clears all captured output and crash info.
     public func clearCapturedOutput() {
         queue.async(flags: .barrier) { [weak self] in
             self?.capturedOutput.removeAll()
@@ -261,6 +281,7 @@ public final class Wappn: @unchecked Sendable {
 
 // MARK: - Enhanced Logger with Interception
 
+/// Log levels for the enhanced logger.
 public enum LogLevel: String {
     case debug = "🔍 DEBUG"
     case info = "ℹ️ INFO"
@@ -271,6 +292,16 @@ public enum LogLevel: String {
 
 @inlinable
 @inline(__always)
+/// Logs a message with a specific log level.
+///
+/// - Parameters:
+///   - level: The severity level of the log.
+///   - items: The items to log.
+///   - separator: The separator between items. Default is a space.
+///   - terminator: The string to append after the log. Default is a newline.
+///   - file: The file name where the log originated.
+///   - line: The line number where the log originated.
+///   - function: The function name where the log originated.
 public func log(_ level: LogLevel,
                 _ items: Any...,
                 separator: String = " ",
@@ -288,6 +319,12 @@ public func log(_ level: LogLevel,
 
 @inlinable
 @inline(__always)
+/// Logs a debug message.
+///
+/// - Parameters:
+///   - items: The items to log.
+///   - separator: The separator between items. Default is a space.
+///   - terminator: The string to append after the log. Default is a newline.
 public func logd(_ items: Any...,
                  separator: String = " ",
                  terminator: String = "\n",
@@ -301,6 +338,12 @@ public func logd(_ items: Any...,
 
 @inlinable
 @inline(__always)
+/// Logs an info message.
+///
+/// - Parameters:
+///   - items: The items to log.
+///   - separator: The separator between items. Default is a space.
+///   - terminator: The string to append after the log. Default is a newline.
 public func logi(_ items: Any...,
                  separator: String = " ",
                  terminator: String = "\n",
@@ -314,6 +357,12 @@ public func logi(_ items: Any...,
 
 @inlinable
 @inline(__always)
+/// Logs a warning message.
+///
+/// - Parameters:
+///   - items: The items to log.
+///   - separator: The separator between items. Default is a space.
+///   - terminator: The string to append after the log. Default is a newline.
 public func logw(_ items: Any...,
                  separator: String = " ",
                  terminator: String = "\n",
@@ -327,6 +376,12 @@ public func logw(_ items: Any...,
 
 @inlinable
 @inline(__always)
+/// Logs an error message.
+///
+/// - Parameters:
+///   - items: The items to log.
+///   - separator: The separator between items. Default is a space.
+///   - terminator: The string to append after the log. Default is a newline.
 public func loge(_ items: Any...,
                  separator: String = " ",
                  terminator: String = "\n",
@@ -340,6 +395,12 @@ public func loge(_ items: Any...,
 
 @inlinable
 @inline(__always)
+/// Logs a verbose message.
+///
+/// - Parameters:
+///   - items: The items to log.
+///   - separator: The separator between items. Default is a space.
+///   - terminator: The string to append after the log. Default is a newline.
 public func logv(_ items: Any...,
                  separator: String = " ",
                  terminator: String = "\n",
