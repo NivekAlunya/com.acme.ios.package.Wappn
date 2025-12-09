@@ -29,7 +29,7 @@ public struct CrashInfo: Codable, Sendable {
 /// The main class for the Wappn package, handling crash detection and log interception.
 ///
 /// Use `Wappn.shared` to access the singleton instance.
-public final class Wappn: @unchecked Sendable {
+public final actor Wappn {
     public static let shared = Wappn()
     
     private var capturedOutput: [String] = []
@@ -58,6 +58,7 @@ public final class Wappn: @unchecked Sendable {
     // MARK: - Public Methods
     
     /// Check if app crashed in previous session
+    @MainActor
     public func didCrashLastTime() -> Bool {
         return FileManager.default.fileExists(atPath: crashFileURL.path)
     }
@@ -74,11 +75,13 @@ public final class Wappn: @unchecked Sendable {
     }
     
     /// Clear crash marker - call after handling previous crash
+    @MainActor
     public func clearCrashMarker() {
         try? FileManager.default.removeItem(at: crashFileURL)
     }
     
     /// Mark app as successfully launched
+    @MainActor
     public func markLaunchSuccess() {
         clearCrashMarker()
     }
@@ -110,9 +113,7 @@ public final class Wappn: @unchecked Sendable {
         let pipeReadEnd = pipe[0]
         let originalStdoutCopy = originalStdout
         
-        DispatchQueue.global(qos: .background).async { [weak self] in
-            self?.readFromPipe(pipeReadEnd: pipeReadEnd, originalStdout: originalStdoutCopy)
-        }
+        readFromPipe(pipeReadEnd: pipeReadEnd, originalStdout: originalStdoutCopy)
         
         // Setup crash handlers
         if interceptCrashes {
@@ -146,17 +147,13 @@ public final class Wappn: @unchecked Sendable {
     /// This is typically populated just before the app terminates.
     /// - Returns: `CrashInfo` if a crash occurred, otherwise `nil`.
     public func getCrashInfo() -> CrashInfo? {
-        return queue.sync {
             return crashInfo
-        }
     }
     
     /// Clears all captured output and crash info.
     public func clearCapturedOutput() {
-        queue.async(flags: .barrier) { [weak self] in
-            self?.capturedOutput.removeAll()
-            self?.crashInfo = nil
-        }
+            self.capturedOutput.removeAll()
+            self.crashInfo = nil
     }
     
     // MARK: - Private Methods
@@ -175,9 +172,7 @@ public final class Wappn: @unchecked Sendable {
             
             // Capture the output
             if let output = String(bytes: buffer[0..<bytesRead], encoding: .utf8) {
-                queue.async(flags: .barrier) { [weak self] in
-                    self?.capturedOutput.append(output)
-                }
+                capturedOutput.append(output)
             }
         }
     }
@@ -239,11 +234,9 @@ public final class Wappn: @unchecked Sendable {
         saveCrashInfo(crash)
         
         // Store crash info synchronously (no async!)
-        queue.sync(flags: .barrier) {
             self.crashInfo = crash
             // Log crash to captured output
             self.capturedOutput.append("\n" + crash.description + "\n")
-        }
         
         // Call user callback synchronously - this is the last chance!
         onCrash?(crash)
