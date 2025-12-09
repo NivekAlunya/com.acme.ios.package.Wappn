@@ -7,7 +7,7 @@
 - **Crash Detection**: Automatically detects if the app crashed in the previous session.
 - **Crash Reporting**: Captures detailed crash information including stack traces, signal info, and timestamps.
 - **Log Interception**: Redirects and captures `stdout` and `print` statements, making them available for debugging or reporting.
-- **Custom Logging**: Provides a set of logging functions (`logd`, `logi`, `logw`, `loge`) with emoji indicators and timestamps.
+- **Custom Logging**: Provides a set of logging functions (`logd`, `logi`, `logw`, `loge`, `logv`) with emoji indicators and timestamps.
 - **Thread Safe**: Designed with concurrency in mind using internal dispatch queues.
 
 ## Installation
@@ -61,6 +61,7 @@ logd("Debug message")      // 🔍 DEBUG
 logi("Info message")       // ℹ️ INFO
 logw("Warning message")    // ⚠️ WARNING
 loge("Error message")      // ❌ ERROR
+logv("Verbose message")    // 💬 VERBOSE
 ```
 
 ### 3. Retrieving Logs

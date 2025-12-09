@@ -127,7 +127,9 @@ public final class Wappn: @unchecked Sendable {
         // Restore original stdout
         dup2(originalStdout, STDOUT_FILENO)
         close(originalStdout)
-        close(pipe[0])
+        if pipe[0] >= 0 {
+            close(pipe[0])
+        }
         
         isIntercepting = false
     }
@@ -263,6 +265,14 @@ public final class Wappn: @unchecked Sendable {
         sync() // Force all pending disk writes
     }
     
+    private func syncFileDescriptor(_ fileDescriptor: Int32) {
+        if fileDescriptor >= 0 {
+            // Force sync to physical disk - CRITICAL for crash persistence
+            fsync(fileDescriptor)
+            close(fileDescriptor)
+        }
+    }
+    
     private func writeAtomic(data: Data) throws {
         
         // Method 1: Try atomic write first
@@ -270,11 +280,7 @@ public final class Wappn: @unchecked Sendable {
         
         // CRITICAL: Open file in READ-WRITE mode for fsync (not O_RDONLY!)
         let fileDescriptor = open(crashFileURL.path, O_RDWR)
-        if fileDescriptor >= 0 {
-            // Force sync to physical disk - CRITICAL for crash persistence
-            fsync(fileDescriptor)
-            close(fileDescriptor)
-        }
+        syncFileDescriptor(fileDescriptor)
         print("✅ Crash info saved to: \(crashFileURL.path)")
     }
     
@@ -283,10 +289,12 @@ public final class Wappn: @unchecked Sendable {
         let fileDescriptor = open(crashFileURL.path, O_WRONLY | O_CREAT | O_TRUNC, 0o644)
         if fileDescriptor >= 0 {
             data.withUnsafeBytes { bytes in
-                _ = write(fileDescriptor, bytes.baseAddress!, bytes.count)
+                guard let baseAddress = bytes.baseAddress, bytes.count > 0 else {
+                    return
+                }
+                _ = write(fileDescriptor, baseAddress, bytes.count)
             }
-            fsync(fileDescriptor) // Force to disk
-            close(fileDescriptor)
+            syncFileDescriptor(fileDescriptor)
             print("✅ Crash info saved via low-level write: \(crashFileURL.path)")
         } else {
             throw NSError(domain: "Wappn", code: 1, userInfo: [NSLocalizedDescriptionKey: "Failed to open file descriptor"])
@@ -347,7 +355,8 @@ public enum LogLevel: String {
 #if !DEBUG
     @inlinable
     @inline(__always)
-#endif/// Logs a message with a specific log level.
+#endif
+/// Logs a message with a specific log level.
 ///
 /// - Parameters:
 ///   - level: The severity level of the log.
@@ -375,7 +384,8 @@ public func log(_ level: LogLevel,
 #if !DEBUG
 @inlinable
 @inline(__always)
-#endif/// Logs a debug message.
+#endif
+/// Logs a debug message.
 ///
 /// - Parameters:
 ///   - items: The items to log.
@@ -388,14 +398,16 @@ public func logd(_ items: Any...,
                  line: Int = #line,
                  function: String = #function) {
     #if DEBUG
-    log(.debug, items, separator: separator, terminator: terminator, file: file, line: line, function: function)
+    let output = items.map { "\($0)" }.joined(separator: separator)
+    log(.debug, output, separator: "", terminator: terminator, file: file, line: line, function: function)
     #endif
 }
 
 #if !DEBUG
 @inlinable
 @inline(__always)
-#endif/// Logs an info message.
+#endif
+/// Logs an info message.
 ///
 /// - Parameters:
 ///   - items: The items to log.
@@ -408,14 +420,16 @@ public func logi(_ items: Any...,
                  line: Int = #line,
                  function: String = #function) {
     #if DEBUG
-    log(.info, items, separator: separator, terminator: terminator, file: file, line: line, function: function)
+    let output = items.map { "\($0)" }.joined(separator: separator)
+    log(.info, output, separator: "", terminator: terminator, file: file, line: line, function: function)
     #endif
 }
 
 #if !DEBUG
 @inlinable
 @inline(__always)
-#endif/// Logs a warning message.
+#endif
+/// Logs a warning message.
 ///
 /// - Parameters:
 ///   - items: The items to log.
@@ -428,14 +442,16 @@ public func logw(_ items: Any...,
                  line: Int = #line,
                  function: String = #function) {
     #if DEBUG
-    log(.warning, items, separator: separator, terminator: terminator, file: file, line: line, function: function)
+    let output = items.map { "\($0)" }.joined(separator: separator)
+    log(.warning, output, separator: "", terminator: terminator, file: file, line: line, function: function)
     #endif
 }
 
 #if !DEBUG
 @inlinable
 @inline(__always)
-#endif/// Logs an error message.
+#endif
+/// Logs an error message.
 ///
 /// - Parameters:
 ///   - items: The items to log.
@@ -448,13 +464,15 @@ public func loge(_ items: Any...,
                  line: Int = #line,
                  function: String = #function) {
     #if DEBUG
-    log(.error, items, separator: separator, terminator: terminator, file: file, line: line, function: function)
+    let output = items.map { "\($0)" }.joined(separator: separator)
+    log(.error, output, separator: "", terminator: terminator, file: file, line: line, function: function)
     #endif
 }
 #if !DEBUG
 @inlinable
 @inline(__always)
-#endif/// Logs a verbose message.
+#endif
+/// Logs a verbose message.
 ///
 /// - Parameters:
 ///   - items: The items to log.
@@ -467,7 +485,8 @@ public func logv(_ items: Any...,
                  line: Int = #line,
                  function: String = #function) {
     #if DEBUG
-    log(.verbose, items, separator: separator, terminator: terminator, file: file, line: line, function: function)
+    let output = items.map { "\($0)" }.joined(separator: separator)
+    log(.verbose, output, separator: "", terminator: terminator, file: file, line: line, function: function)
     #endif
 }
 
