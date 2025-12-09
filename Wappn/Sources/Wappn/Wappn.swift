@@ -92,46 +92,50 @@ public final class Wappn: @unchecked Sendable {
     ///
     /// - Parameter interceptCrashes: If `true`, sets up handlers for uncaught exceptions and fatal signals.
     public func startIntercepting(interceptCrashes: Bool = true) {
-        guard !isIntercepting else { return }
-        
-        // Save original stdout
-        originalStdout = dup(STDOUT_FILENO)
-        
-        // Create pipe
-        Darwin.pipe(&pipe)
-        
-        // Redirect stdout to pipe write end
-        dup2(pipe[1], STDOUT_FILENO)
-        close(pipe[1])
-        
-        isIntercepting = true
-        
-        // Start reading from pipe in background
-        let pipeReadEnd = pipe[0]
-        let originalStdoutCopy = originalStdout
-        
-        DispatchQueue.global(qos: .background).async { [weak self] in
-            self?.readFromPipe(pipeReadEnd: pipeReadEnd, originalStdout: originalStdoutCopy)
-        }
-        
-        // Setup crash handlers
-        if interceptCrashes {
-            setupCrashHandlers()
+        queue.sync(flags: .barrier) {
+            guard !isIntercepting else { return }
+            
+            // Save original stdout
+            originalStdout = dup(STDOUT_FILENO)
+            
+            // Create pipe
+            Darwin.pipe(&pipe)
+            
+            // Redirect stdout to pipe write end
+            dup2(pipe[1], STDOUT_FILENO)
+            close(pipe[1])
+            
+            isIntercepting = true
+            
+            // Start reading from pipe in background
+            let pipeReadEnd = pipe[0]
+            let originalStdoutCopy = originalStdout
+            
+            DispatchQueue.global(qos: .background).async { [weak self] in
+                self?.readFromPipe(pipeReadEnd: pipeReadEnd, originalStdout: originalStdoutCopy)
+            }
+            
+            // Setup crash handlers
+            if interceptCrashes {
+                setupCrashHandlers()
+            }
         }
     }
     
     /// Stops intercepting standard output and restores the original stdout.
     public func stopIntercepting() {
-        guard isIntercepting else { return }
-        
-        // Restore original stdout
-        dup2(originalStdout, STDOUT_FILENO)
-        close(originalStdout)
-        if pipe[0] >= 0 {
-            close(pipe[0])
+        queue.sync(flags: .barrier) {
+            guard isIntercepting else { return }
+            
+            // Restore original stdout
+            dup2(originalStdout, STDOUT_FILENO)
+            close(originalStdout)
+            if pipe[0] >= 0 {
+                close(pipe[0])
+            }
+            
+            isIntercepting = false
         }
-        
-        isIntercepting = false
     }
     
     /// Returns all captured output strings.
@@ -167,7 +171,12 @@ public final class Wappn: @unchecked Sendable {
         let bufferSize = 4096
         var buffer = [UInt8](repeating: 0, count: bufferSize)
         
-        while isIntercepting {
+        var shouldContinue = true
+        while shouldContinue {
+            // Check if we should continue reading in a thread-safe way
+            shouldContinue = queue.sync { isIntercepting }
+            guard shouldContinue else { break }
+            
             let bytesRead = read(pipeReadEnd, &buffer, bufferSize)
             
             guard bytesRead > 0 else { break }
@@ -240,21 +249,22 @@ public final class Wappn: @unchecked Sendable {
         // CRITICAL: Save crash info FIRST - this is the most important operation
         saveCrashInfo(crash)
         
-        // Store crash info synchronously (no async!)
-        queue.sync(flags: .barrier) {
+        // Store crash info and get originalStdout synchronously (no async!)
+        let stdoutCopy = queue.sync(flags: .barrier) { () -> Int32 in
             self.crashInfo = crash
             // Log crash to captured output
             self.capturedOutput.append("\n" + crash.description + "\n")
+            return self.originalStdout
         }
         
         // Call user callback synchronously - this is the last chance!
         onCrash?(crash)
         
         // Also write to original stdout
-        if originalStdout >= 0 {
+        if stdoutCopy >= 0 {
             let crashDesc = crash.description
             _ = crashDesc.withCString { ptr in
-                write(originalStdout, ptr, strlen(ptr))
+                write(stdoutCopy, ptr, strlen(ptr))
             }
         }
         print("⚠️ Wappn detected a crash: \(crash.reason)")
