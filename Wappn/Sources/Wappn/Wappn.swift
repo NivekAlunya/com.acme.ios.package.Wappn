@@ -402,7 +402,7 @@ public func logd(_ items: Any...,
                  function: String = #function) {
     #if DEBUG
     let output = items.map { "\($0)" }.joined(separator: separator)
-    log(.debug, output, separator: separator, terminator: terminator, file: file, line: line, function: function)
+    log(.debug, output, terminator: terminator, file: file, line: line, function: function)
     #endif
 }
 
@@ -424,7 +424,7 @@ public func logi(_ items: Any...,
                  function: String = #function) {
     #if DEBUG
     let output = items.map { "\($0)" }.joined(separator: separator)
-    log(.info, output, separator: separator, terminator: terminator, file: file, line: line, function: function)
+    log(.info, output, terminator: terminator, file: file, line: line, function: function)
     #endif
 }
 
@@ -446,7 +446,7 @@ public func logw(_ items: Any...,
                  function: String = #function) {
     #if DEBUG
     let output = items.map { "\($0)" }.joined(separator: separator)
-    log(.warning, output, separator: separator, terminator: terminator, file: file, line: line, function: function)
+    log(.warning, output, terminator: terminator, file: file, line: line, function: function)
     #endif
 }
 
@@ -468,7 +468,7 @@ public func loge(_ items: Any...,
                  function: String = #function) {
     #if DEBUG
     let output = items.map { "\($0)" }.joined(separator: separator)
-    log(.error, output, separator: separator, terminator: terminator, file: file, line: line, function: function)
+    log(.error, output, terminator: terminator, file: file, line: line, function: function)
     #endif
 }
 #if !DEBUG
@@ -489,7 +489,7 @@ public func logv(_ items: Any...,
                  function: String = #function) {
     #if DEBUG
     let output = items.map { "\($0)" }.joined(separator: separator)
-    log(.verbose, output, separator: separator, terminator: terminator, file: file, line: line, function: function)
+    log(.verbose, output, terminator: terminator, file: file, line: line, function: function)
     #endif
 }
 
