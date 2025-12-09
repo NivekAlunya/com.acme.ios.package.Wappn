@@ -41,8 +41,6 @@ public final class Wappn: @unchecked Sendable {
     
     // Crash storage keys
     private let crashFileURL: URL
-    private let crashMarkerKey = "com.wappn.didCrashLastTime"
-    private let lastCrashKey = "com.wappn.lastCrashInfo"
     
     // Crash handler callback
     /// Callback triggered when a crash occurs.
@@ -55,17 +53,13 @@ public final class Wappn: @unchecked Sendable {
         // Setup crash file path
         let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
         crashFileURL = documents.appendingPathComponent("last_crash.json")
-        
-        // Mark app as running (if it crashes, this won't be cleared)
-        UserDefaults.standard.set(true, forKey: crashMarkerKey)
-        UserDefaults.standard.synchronize()
     }
     
     // MARK: - Public Methods
     
     /// Check if app crashed in previous session
     public func didCrashLastTime() -> Bool {
-        return UserDefaults.standard.bool(forKey: crashMarkerKey)
+        return FileManager.default.fileExists(atPath: crashFileURL.path)
     }
     
     /// Get crash info from previous session
@@ -75,27 +69,23 @@ public final class Wappn: @unchecked Sendable {
            let crash = try? JSONDecoder().decode(CrashInfo.self, from: data) {
             return crash
         }
-        
-        // Fallback to UserDefaults
-        if let data = UserDefaults.standard.data(forKey: lastCrashKey),
-           let crash = try? JSONDecoder().decode(CrashInfo.self, from: data) {
-            return crash
-        }
-        
+                
         return nil
     }
     
     /// Clear crash marker - call after handling previous crash
     public func clearCrashMarker() {
-        UserDefaults.standard.set(false, forKey: crashMarkerKey)
-        UserDefaults.standard.removeObject(forKey: lastCrashKey)
         try? FileManager.default.removeItem(at: crashFileURL)
-        UserDefaults.standard.synchronize()
     }
     
     /// Mark app as successfully launched
     public func markLaunchSuccess() {
         clearCrashMarker()
+    }
+    
+    /// Get the path where crash files are stored
+    public func getCrashFilePath() -> String {
+        return crashFileURL.path
     }
     
     /// Starts intercepting standard output and monitoring for crashes.
@@ -195,8 +185,10 @@ public final class Wappn: @unchecked Sendable {
     // MARK: - Crash Handling
     
     private func setupCrashHandlers() {
-        // NSException handler
+        // NSException handler (for Objective-C exceptions)
+        // Note: This only catches NSExceptions, not Swift runtime errors
         NSSetUncaughtExceptionHandler { exception in
+            print("⚠️ Uncaught NSException detected: \(exception.reason ?? "Unknown")")
             let crash = CrashInfo(
                 timestamp: Date(),
                 reason: exception.reason ?? "Unknown exception",
@@ -210,7 +202,17 @@ public final class Wappn: @unchecked Sendable {
         }
         
         // Signal handlers for fatal signals
-        let signals: [Int32] = [SIGABRT, SIGILL, SIGSEGV, SIGFPE, SIGBUS, SIGPIPE]
+        // SIGTRAP: Essential for Swift runtime errors (precondition failures, force unwraps, etc.)
+        // SIGABRT: Abort signals (often from assertions)
+        // SIGILL: Illegal instruction
+        // SIGSEGV: Segmentation fault (memory access violations)
+        // SIGFPE: Floating point exceptions
+        // SIGBUS: Bus error (memory alignment issues)
+        // SIGPIPE: Broken pipe (writing to closed pipe/socket)
+        // SIGXCPU: CPU time limit exceeded
+        // SIGXFSZ: File size limit exceeded
+        // SIGSYS: Bad system call (invalid syscall)
+        let signals: [Int32] = [SIGTRAP, SIGABRT, SIGILL, SIGSEGV, SIGFPE, SIGBUS, SIGPIPE, SIGXCPU, SIGXFSZ, SIGSYS]
         for sig in signals {
             signal(sig) { signal in
                 let shared = Wappn.shared
@@ -233,18 +235,18 @@ public final class Wappn: @unchecked Sendable {
     }
     
     private func handleCrash(_ crash: CrashInfo) {
-        // Save crash info synchronously (we're about to crash!)
+        // CRITICAL: Save crash info FIRST - this is the most important operation
         saveCrashInfo(crash)
         
-        queue.async(flags: .barrier) { [weak self] in
-            self?.crashInfo = crash
-            
+        // Store crash info synchronously (no async!)
+        queue.sync(flags: .barrier) {
+            self.crashInfo = crash
             // Log crash to captured output
-            self?.capturedOutput.append("\n" + crash.description + "\n")
-            
-            // Call user callback
-            self?.onCrash?(crash)
+            self.capturedOutput.append("\n" + crash.description + "\n")
         }
+        
+        // Call user callback synchronously - this is the last chance!
+        onCrash?(crash)
         
         // Also write to original stdout
         if originalStdout >= 0 {
@@ -253,27 +255,79 @@ public final class Wappn: @unchecked Sendable {
                 write(originalStdout, ptr, strlen(ptr))
             }
         }
+        print("⚠️ Wappn detected a crash: \(crash.reason)")
+        
+        // Force flush to disk AFTER writing everything
+        fflush(stdout)
+        fflush(stderr)
+        sync() // Force all pending disk writes
     }
     
+    private func writeAtomic(data: Data) throws {
+        
+        // Method 1: Try atomic write first
+        try data.write(to: crashFileURL, options: [.atomic])
+        
+        // CRITICAL: Open file in READ-WRITE mode for fsync (not O_RDONLY!)
+        let fileDescriptor = open(crashFileURL.path, O_RDWR)
+        if fileDescriptor >= 0 {
+            // Force sync to physical disk - CRITICAL for crash persistence
+            fsync(fileDescriptor)
+            close(fileDescriptor)
+        }
+        print("✅ Crash info saved to: \(crashFileURL.path)")
+    }
+    
+    private func writeLowLevel(data: Data) throws {
+        // Method 2: Try direct file descriptor write (more reliable in crash)
+        let fileDescriptor = open(crashFileURL.path, O_WRONLY | O_CREAT | O_TRUNC, 0o644)
+        if fileDescriptor >= 0 {
+            data.withUnsafeBytes { bytes in
+                _ = write(fileDescriptor, bytes.baseAddress!, bytes.count)
+            }
+            fsync(fileDescriptor) // Force to disk
+            close(fileDescriptor)
+            print("✅ Crash info saved via low-level write: \(crashFileURL.path)")
+        } else {
+            throw NSError(domain: "Wappn", code: 1, userInfo: [NSLocalizedDescriptionKey: "Failed to open file descriptor"])
+        }
+    }
+        
     private func saveCrashInfo(_ crash: CrashInfo) {
-        // Save to file
-        if let data = try? JSONEncoder().encode(crash) {
-            try? data.write(to: crashFileURL, options: .atomic)
-            
-            // Also save to UserDefaults as backup
-            UserDefaults.standard.set(data, forKey: lastCrashKey)
-            UserDefaults.standard.synchronize()
+        // CRITICAL: Use most reliable write method in crash scenario
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = .prettyPrinted
+        
+        guard let data = try? encoder.encode(crash) else {
+            print("❌ Failed to encode crash info")
+            return
+        }
+        
+        // Try atomic write first, fallback to low-level write if it fails
+        do {
+            try writeAtomic(data: data)
+        } catch {
+            print("⚠️ Atomic write failed, trying low-level write: \(error)")
+            do {
+                try writeLowLevel(data: data)
+            } catch {
+                print("❌ All write methods failed: \(error)")
+            }
         }
     }
     
     private func signalName(for signal: Int32) -> String {
         switch signal {
+        case SIGTRAP: return "SIGTRAP (Swift Runtime Error)"
         case SIGABRT: return "SIGABRT (Abort)"
         case SIGILL: return "SIGILL (Illegal Instruction)"
         case SIGSEGV: return "SIGSEGV (Segmentation Fault)"
         case SIGFPE: return "SIGFPE (Floating Point Exception)"
         case SIGBUS: return "SIGBUS (Bus Error)"
         case SIGPIPE: return "SIGPIPE (Broken Pipe)"
+        case SIGXCPU: return "SIGXCPU (CPU Time Limit Exceeded)"
+        case SIGXFSZ: return "SIGXFSZ (File Size Limit Exceeded)"
+        case SIGSYS: return "SIGSYS (Bad System Call)"
         default: return "Signal \(signal)"
         }
     }
@@ -290,9 +344,10 @@ public enum LogLevel: String {
     case verbose = "💬 VERBOSE"
 }
 
-@inlinable
-@inline(__always)
-/// Logs a message with a specific log level.
+#if !DEBUG
+    @inlinable
+    @inline(__always)
+#endif/// Logs a message with a specific log level.
 ///
 /// - Parameters:
 ///   - level: The severity level of the log.
@@ -317,9 +372,10 @@ public func log(_ level: LogLevel,
     #endif
 }
 
+#if !DEBUG
 @inlinable
 @inline(__always)
-/// Logs a debug message.
+#endif/// Logs a debug message.
 ///
 /// - Parameters:
 ///   - items: The items to log.
@@ -336,9 +392,10 @@ public func logd(_ items: Any...,
     #endif
 }
 
+#if !DEBUG
 @inlinable
 @inline(__always)
-/// Logs an info message.
+#endif/// Logs an info message.
 ///
 /// - Parameters:
 ///   - items: The items to log.
@@ -355,9 +412,10 @@ public func logi(_ items: Any...,
     #endif
 }
 
+#if !DEBUG
 @inlinable
 @inline(__always)
-/// Logs a warning message.
+#endif/// Logs a warning message.
 ///
 /// - Parameters:
 ///   - items: The items to log.
@@ -374,9 +432,10 @@ public func logw(_ items: Any...,
     #endif
 }
 
+#if !DEBUG
 @inlinable
 @inline(__always)
-/// Logs an error message.
+#endif/// Logs an error message.
 ///
 /// - Parameters:
 ///   - items: The items to log.
@@ -392,10 +451,10 @@ public func loge(_ items: Any...,
     log(.error, items, separator: separator, terminator: terminator, file: file, line: line, function: function)
     #endif
 }
-
+#if !DEBUG
 @inlinable
 @inline(__always)
-/// Logs a verbose message.
+#endif/// Logs a verbose message.
 ///
 /// - Parameters:
 ///   - items: The items to log.
@@ -412,84 +471,3 @@ public func logv(_ items: Any...,
     #endif
 }
 
-// MARK: - Usage Example
-/*
-
-// === AT APP LAUNCH (AppDelegate/SceneDelegate) ===
-
-func application(_ application: UIApplication,
-                 didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?) -> Bool {
-    
-    // Check for previous crash BEFORE starting interception
-    if Wappn.shared.didCrashLastTime() {
-        print("⚠️ App crashed in previous session!")
-        
-        // Get detailed crash info
-        if let crashInfo = Wappn.shared.getLastCrashInfo() {
-            print(crashInfo.description)
-            
-            // Handle crash: upload to server, show alert, etc.
-            uploadCrashReport(crashInfo)
-            
-            // Or show alert to user
-            showCrashAlert(crashInfo)
-        }
-        
-        // Clear crash marker after handling
-        Wappn.shared.clearCrashMarker()
-    }
-    
-    // Start intercepting for this session
-    Wappn.shared.startIntercepting(interceptCrashes: true)
-    
-    // Optional: Set crash callback for current session
-    Wappn.shared.onCrash = { crashInfo in
-        print("App is crashing! Saving report...")
-        // Last chance to save data before crash
-    }
-    
-    // Mark successful launch (optional, after your app is stable)
-    // Call this after critical initialization succeeds
-    DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
-        Wappn.shared.markLaunchSuccess()
-    }
-    
-    return true
-}
-
-// === DURING APP RUNTIME ===
-
-// Normal logging - all captured
-logd("Debug message")
-logi("App started successfully")
-print("Regular output")
-
-// Get all captured output
-let allOutput = Wappn.shared.getCapturedOutput()
-
-// === EXAMPLE: Show crash alert ===
-
-func showCrashAlert(_ crashInfo: CrashInfo) {
-    let alert = UIAlertController(
-        title: "Previous Crash Detected",
-        message: "The app crashed last time. Would you like to send a crash report?",
-        preferredStyle: .alert
-    )
-    
-    alert.addAction(UIAlertAction(title: "Send Report", style: .default) { _ in
-        uploadCrashReport(crashInfo)
-    })
-    
-    alert.addAction(UIAlertAction(title: "Dismiss", style: .cancel))
-    
-    // Present alert
-    // window?.rootViewController?.present(alert, animated: true)
-}
-
-func uploadCrashReport(_ crashInfo: CrashInfo) {
-    let report = crashInfo.description
-    // Upload to your server, Firebase Crashlytics, etc.
-    print("Uploading crash report...")
-}
-
-*/
