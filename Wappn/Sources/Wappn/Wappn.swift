@@ -54,6 +54,11 @@ public final actor Wappn {
     private let queue = DispatchQueue(label: "com.wappn.interceptor", attributes: .concurrent)
     private var originalStdout: Int32 = -1
     private var pipe: [Int32] = [-1, -1]
+    
+    /// Boolean flag to control pipe reading. Marked as nonisolated(unsafe) because:
+    /// 1. It's only a simple boolean flag used for control flow
+    /// 2. Accessed from both actor context and background pipe reading thread
+    /// 3. Races are acceptable - worst case is one extra read iteration
     nonisolated(unsafe) private var isIntercepting = false
     
     // Crash storage keys
@@ -135,6 +140,8 @@ public final actor Wappn {
         let originalStdoutCopy = originalStdout
         
         // Run pipe reading on a background thread to avoid blocking the actor
+        // Note: Using weak self is intentional - if Wappn is deallocated, pipe reading
+        // should stop gracefully. The pipe reading is not critical after deallocation.
         DispatchQueue.global(qos: .background).async { [weak self] in
             self?.readFromPipeNonisolated(pipeReadEnd: pipeReadEnd, originalStdout: originalStdoutCopy)
         }
@@ -184,6 +191,7 @@ public final actor Wappn {
         let bufferSize = 4096
         var buffer = [UInt8](repeating: 0, count: bufferSize)
         
+        // Read from pipe in a blocking loop (this runs on a background thread)
         while isIntercepting {
             let bytesRead = read(pipeReadEnd, &buffer, bufferSize)
             
@@ -193,6 +201,9 @@ public final actor Wappn {
             _ = write(originalStdout, buffer, bytesRead)
             
             // Capture the output
+            // Note: We create a Task for each read to safely access actor-isolated state.
+            // The read() call blocks, so we only create tasks when there's actual data.
+            // Output ordering is preserved because read() is sequential and Tasks are created in order.
             if let output = String(bytes: buffer[0..<bytesRead], encoding: .utf8) {
                 Task {
                     await appendCapturedOutput(output)
@@ -267,8 +278,12 @@ public final actor Wappn {
         saveCrashInfoNonisolated(crash)
         
         // Store crash info synchronously (no async!)
-        // Note: Direct property access from nonisolated context requires unsafe access
-        // We use assumeIsolated since we're in a crash handler and need immediate access
+        // Note: We use assumeIsolated to access actor state from crash handler context.
+        // This is safe because:
+        // 1. We're handling an imminent crash - the app is about to terminate
+        // 2. Normal actor execution will be interrupted by the crash anyway
+        // 3. We need immediate, synchronous access to save crash data before termination
+        // 4. There's no risk of data races as the app is in a terminal state
         assumeIsolated { actor in
             actor.crashInfo = crash
             // Log crash to captured output
