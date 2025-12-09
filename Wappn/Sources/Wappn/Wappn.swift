@@ -29,12 +29,13 @@ public struct CrashInfo: Codable, Sendable {
 /// The main class for the Wappn package, handling crash detection and log interception.
 ///
 /// Use `Wappn.shared` to access the singleton instance.
-public final actor Wappn {
+public final class Wappn: @unchecked Sendable {
     public static let shared = Wappn()
     
     private var capturedOutput: [String] = []
     private var crashInfo: CrashInfo?
     private let queue = DispatchQueue(label: "com.wappn.interceptor", attributes: .concurrent)
+    private let lock = NSLock() // For thread-safe access to mutable properties
     private var originalStdout: Int32 = -1
     private var pipe: [Int32] = [-1, -1]
     private var isIntercepting = false
@@ -58,7 +59,6 @@ public final actor Wappn {
     // MARK: - Public Methods
     
     /// Check if app crashed in previous session
-    @MainActor
     public func didCrashLastTime() -> Bool {
         return FileManager.default.fileExists(atPath: crashFileURL.path)
     }
@@ -75,13 +75,11 @@ public final actor Wappn {
     }
     
     /// Clear crash marker - call after handling previous crash
-    @MainActor
     public func clearCrashMarker() {
         try? FileManager.default.removeItem(at: crashFileURL)
     }
     
     /// Mark app as successfully launched
-    @MainActor
     public func markLaunchSuccess() {
         clearCrashMarker()
     }
@@ -95,6 +93,9 @@ public final actor Wappn {
     ///
     /// - Parameter interceptCrashes: If `true`, sets up handlers for uncaught exceptions and fatal signals.
     public func startIntercepting(interceptCrashes: Bool = true) {
+        lock.lock()
+        defer { lock.unlock() }
+        
         guard !isIntercepting else { return }
         
         // Save original stdout
@@ -113,7 +114,9 @@ public final actor Wappn {
         let pipeReadEnd = pipe[0]
         let originalStdoutCopy = originalStdout
         
-        readFromPipe(pipeReadEnd: pipeReadEnd, originalStdout: originalStdoutCopy)
+        queue.async { [weak self] in
+            self?.readFromPipe(pipeReadEnd: pipeReadEnd, originalStdout: originalStdoutCopy)
+        }
         
         // Setup crash handlers
         if interceptCrashes {
@@ -123,6 +126,9 @@ public final actor Wappn {
     
     /// Stops intercepting standard output and restores the original stdout.
     public func stopIntercepting() {
+        lock.lock()
+        defer { lock.unlock() }
+        
         guard isIntercepting else { return }
         
         // Restore original stdout
@@ -147,13 +153,17 @@ public final actor Wappn {
     /// This is typically populated just before the app terminates.
     /// - Returns: `CrashInfo` if a crash occurred, otherwise `nil`.
     public func getCrashInfo() -> CrashInfo? {
-            return crashInfo
+        lock.lock()
+        defer { lock.unlock() }
+        return crashInfo
     }
     
     /// Clears all captured output and crash info.
     public func clearCapturedOutput() {
-            self.capturedOutput.removeAll()
-            self.crashInfo = nil
+        lock.lock()
+        defer { lock.unlock() }
+        capturedOutput.removeAll()
+        crashInfo = nil
     }
     
     // MARK: - Private Methods
@@ -162,7 +172,13 @@ public final actor Wappn {
         let bufferSize = 4096
         var buffer = [UInt8](repeating: 0, count: bufferSize)
         
-        while isIntercepting {
+        while true {
+            lock.lock()
+            let shouldContinue = isIntercepting
+            lock.unlock()
+            
+            guard shouldContinue else { break }
+            
             let bytesRead = read(pipeReadEnd, &buffer, bufferSize)
             
             guard bytesRead > 0 else { break }
@@ -172,7 +188,9 @@ public final actor Wappn {
             
             // Capture the output
             if let output = String(bytes: buffer[0..<bytesRead], encoding: .utf8) {
+                lock.lock()
                 capturedOutput.append(output)
+                lock.unlock()
             }
         }
     }
@@ -234,12 +252,15 @@ public final actor Wappn {
         saveCrashInfo(crash)
         
         // Store crash info synchronously (no async!)
-            self.crashInfo = crash
-            // Log crash to captured output
-            self.capturedOutput.append("\n" + crash.description + "\n")
+        lock.lock()
+        crashInfo = crash
+        // Log crash to captured output
+        capturedOutput.append("\n" + crash.description + "\n")
+        let callback = onCrash
+        lock.unlock()
         
         // Call user callback synchronously - this is the last chance!
-        onCrash?(crash)
+        callback?(crash)
         
         // Also write to original stdout
         if originalStdout >= 0 {
@@ -256,36 +277,7 @@ public final actor Wappn {
         sync() // Force all pending disk writes
     }
     
-    private func writeAtomic(data: Data) throws {
-        
-        // Method 1: Try atomic write first
-        try data.write(to: crashFileURL, options: [.atomic])
-        
-        // CRITICAL: Open file in READ-WRITE mode for fsync (not O_RDONLY!)
-        let fileDescriptor = open(crashFileURL.path, O_RDWR)
-        if fileDescriptor >= 0 {
-            // Force sync to physical disk - CRITICAL for crash persistence
-            fsync(fileDescriptor)
-            close(fileDescriptor)
-        }
-        print("✅ Crash info saved to: \(crashFileURL.path)")
-    }
-    
-    private func writeLowLevel(data: Data) throws {
-        // Method 2: Try direct file descriptor write (more reliable in crash)
-        let fileDescriptor = open(crashFileURL.path, O_WRONLY | O_CREAT | O_TRUNC, 0o644)
-        if fileDescriptor >= 0 {
-            data.withUnsafeBytes { bytes in
-                _ = write(fileDescriptor, bytes.baseAddress!, bytes.count)
-            }
-            fsync(fileDescriptor) // Force to disk
-            close(fileDescriptor)
-            print("✅ Crash info saved via low-level write: \(crashFileURL.path)")
-        } else {
-            throw NSError(domain: "Wappn", code: 1, userInfo: [NSLocalizedDescriptionKey: "Failed to open file descriptor"])
-        }
-    }
-        
+
     private func saveCrashInfo(_ crash: CrashInfo) {
         // CRITICAL: Use most reliable write method in crash scenario
         let encoder = JSONEncoder()
@@ -296,17 +288,39 @@ public final actor Wappn {
             return
         }
         
-        // Try atomic write first, fallback to low-level write if it fails
+        writeCrashData(data)
+    }
+    
+    private func writeCrashData(_ data: Data) {
+        // Method 1: Try atomic write with fsync
         do {
-            try writeAtomic(data: data)
+            try data.write(to: crashFileURL, options: [.atomic])
+            
+            // CRITICAL: Open file in READ-WRITE mode for fsync (not O_RDONLY!)
+            let fileDescriptor = open(crashFileURL.path, O_RDWR)
+            if fileDescriptor >= 0 {
+                fsync(fileDescriptor) // Force sync to physical disk
+                close(fileDescriptor)
+            }
+            print("✅ Crash info saved to: \(crashFileURL.path)")
+            return
         } catch {
             print("⚠️ Atomic write failed, trying low-level write: \(error)")
-            do {
-                try writeLowLevel(data: data)
-            } catch {
-                print("❌ All write methods failed: \(error)")
-            }
         }
+        
+        // Method 2: Fallback to direct file descriptor write (more reliable in crash scenarios)
+        let fileDescriptor = open(crashFileURL.path, O_WRONLY | O_CREAT | O_TRUNC, 0o644)
+        guard fileDescriptor >= 0 else {
+            print("❌ Failed to open file descriptor")
+            return
+        }
+        
+        data.withUnsafeBytes { bytes in
+            _ = write(fileDescriptor, bytes.baseAddress!, bytes.count)
+        }
+        fsync(fileDescriptor) // Force to disk
+        close(fileDescriptor)
+        print("✅ Crash info saved via low-level write: \(crashFileURL.path)")
     }
     
     private func signalName(for signal: Int32) -> String {
@@ -361,7 +375,8 @@ public func log(_ level: LogLevel,
     let fileName = (file as NSString).lastPathComponent
     let output = items.map { "\($0)" }.joined(separator: separator)
     let timestamp = DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .medium)
-    print("[\(timestamp)] \(level.rawValue) [\(fileName):\(line)] \(function) - \(output)", terminator: terminator)
+    let logMessage = "[\(timestamp)] [\(level.rawValue)] [\(fileName):\(line) \(function)] - \(output)"
+    print(logMessage, terminator: terminator)
     #endif
 }
 
