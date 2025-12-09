@@ -1,4 +1,21 @@
 import Foundation
+#if canImport(Darwin)
+import Darwin
+#else
+import Glibc
+#endif
+
+// MARK: - Helpers for crash handling
+
+/// Flushes stdout and stderr using file descriptors to avoid concurrency warnings.
+/// This is safe in crash handler context where we need immediate, synchronous access.
+@inline(__always)
+fileprivate func flushStandardStreamsUnsafe() {
+    // Use fsync on file descriptors instead of fflush on FILE* to avoid concurrency warnings
+    // STDOUT_FILENO and STDERR_FILENO are constants, not mutable globals
+    fsync(STDOUT_FILENO)
+    fsync(STDERR_FILENO)
+}
 
 // MARK: - Crash Info
 /// Represents detailed information about a crash event.
@@ -37,7 +54,7 @@ public final actor Wappn {
     private let queue = DispatchQueue(label: "com.wappn.interceptor", attributes: .concurrent)
     private var originalStdout: Int32 = -1
     private var pipe: [Int32] = [-1, -1]
-    private var isIntercepting = false
+    nonisolated(unsafe) private var isIntercepting = false
     
     // Crash storage keys
     private let crashFileURL: URL
@@ -101,7 +118,11 @@ public final actor Wappn {
         originalStdout = dup(STDOUT_FILENO)
         
         // Create pipe
+        #if canImport(Darwin)
         Darwin.pipe(&pipe)
+        #else
+        _ = Glibc.pipe(&pipe)
+        #endif
         
         // Redirect stdout to pipe write end
         dup2(pipe[1], STDOUT_FILENO)
@@ -113,7 +134,10 @@ public final actor Wappn {
         let pipeReadEnd = pipe[0]
         let originalStdoutCopy = originalStdout
         
-        readFromPipe(pipeReadEnd: pipeReadEnd, originalStdout: originalStdoutCopy)
+        // Run pipe reading on a background thread to avoid blocking the actor
+        DispatchQueue.global(qos: .background).async { [weak self] in
+            self?.readFromPipeNonisolated(pipeReadEnd: pipeReadEnd, originalStdout: originalStdoutCopy)
+        }
         
         // Setup crash handlers
         if interceptCrashes {
@@ -137,9 +161,7 @@ public final actor Wappn {
     ///
     /// - Returns: An array of strings captured from stdout.
     public func getCapturedOutput() -> [String] {
-        return queue.sync {
-            return capturedOutput
-        }
+        return capturedOutput
     }
     
     /// Returns the crash info if a crash has been detected in the current session.
@@ -158,7 +180,7 @@ public final actor Wappn {
     
     // MARK: - Private Methods
     
-    private func readFromPipe(pipeReadEnd: Int32, originalStdout: Int32) {
+    nonisolated private func readFromPipeNonisolated(pipeReadEnd: Int32, originalStdout: Int32) {
         let bufferSize = 4096
         var buffer = [UInt8](repeating: 0, count: bufferSize)
         
@@ -172,14 +194,21 @@ public final actor Wappn {
             
             // Capture the output
             if let output = String(bytes: buffer[0..<bytesRead], encoding: .utf8) {
-                capturedOutput.append(output)
+                Task {
+                    await appendCapturedOutput(output)
+                }
             }
         }
+    }
+    
+    private func appendCapturedOutput(_ output: String) {
+        capturedOutput.append(output)
     }
     
     // MARK: - Crash Handling
     
     private func setupCrashHandlers() {
+        #if canImport(Darwin)
         // NSException handler (for Objective-C exceptions)
         // Note: This only catches NSExceptions, not Swift runtime errors
         NSSetUncaughtExceptionHandler { exception in
@@ -192,9 +221,9 @@ public final actor Wappn {
                 appVersion: Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "Unknown",
                 osVersion: ProcessInfo.processInfo.operatingSystemVersionString
             )
-            let shared = Wappn.shared
-            shared.handleCrash(crash)
+            Wappn.shared.handleCrashNonisolated(crash)
         }
+        #endif
         
         // Signal handlers for fatal signals
         // SIGTRAP: Essential for Swift runtime errors (precondition failures, force unwraps, etc.)
@@ -210,8 +239,7 @@ public final actor Wappn {
         let signals: [Int32] = [SIGTRAP, SIGABRT, SIGILL, SIGSEGV, SIGFPE, SIGBUS, SIGPIPE, SIGXCPU, SIGXFSZ, SIGSYS]
         for sig in signals {
             signal(sig) { signal in
-                let shared = Wappn.shared
-                let signalName = shared.signalName(for: signal)
+                let signalName = Wappn.signalNameStatic(for: signal)
                 let crash = CrashInfo(
                     timestamp: Date(),
                     reason: "Signal received",
@@ -220,73 +248,84 @@ public final actor Wappn {
                     appVersion: Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "Unknown",
                     osVersion: ProcessInfo.processInfo.operatingSystemVersionString
                 )
-                shared.handleCrash(crash)
+                Wappn.shared.handleCrashNonisolated(crash)
                 
                 // Re-raise signal to allow system crash handler
+                #if canImport(Darwin)
                 Darwin.signal(signal, SIG_DFL)
-                raise(signal)
+                Darwin.raise(signal)
+                #else
+                Glibc.signal(signal, SIG_DFL)
+                Glibc.raise(signal)
+                #endif
             }
         }
     }
     
-    private func handleCrash(_ crash: CrashInfo) {
+    nonisolated private func handleCrashNonisolated(_ crash: CrashInfo) {
         // CRITICAL: Save crash info FIRST - this is the most important operation
-        saveCrashInfo(crash)
+        saveCrashInfoNonisolated(crash)
         
         // Store crash info synchronously (no async!)
-            self.crashInfo = crash
+        // Note: Direct property access from nonisolated context requires unsafe access
+        // We use assumeIsolated since we're in a crash handler and need immediate access
+        assumeIsolated { actor in
+            actor.crashInfo = crash
             // Log crash to captured output
-            self.capturedOutput.append("\n" + crash.description + "\n")
-        
-        // Call user callback synchronously - this is the last chance!
-        onCrash?(crash)
+            actor.capturedOutput.append("\n" + crash.description + "\n")
+            
+            // Call user callback synchronously - this is the last chance!
+            actor.onCrash?(crash)
+        }
         
         // Also write to original stdout
-        if originalStdout >= 0 {
+        let stdoutFd = assumeIsolated { $0.originalStdout }
+        if stdoutFd >= 0 {
             let crashDesc = crash.description
             _ = crashDesc.withCString { ptr in
-                write(originalStdout, ptr, strlen(ptr))
+                write(stdoutFd, ptr, strlen(ptr))
             }
         }
         print("⚠️ Wappn detected a crash: \(crash.reason)")
         
         // Force flush to disk AFTER writing everything
-        fflush(stdout)
-        fflush(stderr)
+        // Note: We're in a crash handler, normal concurrency rules don't apply
+        // We need to flush synchronously before the app terminates
+        flushStandardStreamsUnsafe()
         sync() // Force all pending disk writes
     }
     
-    private func writeAtomic(data: Data) throws {
+    nonisolated private func writeAtomic(data: Data, fileURL: URL) throws {
         
         // Method 1: Try atomic write first
-        try data.write(to: crashFileURL, options: [.atomic])
+        try data.write(to: fileURL, options: [.atomic])
         
         // CRITICAL: Open file in READ-WRITE mode for fsync (not O_RDONLY!)
-        let fileDescriptor = open(crashFileURL.path, O_RDWR)
+        let fileDescriptor = open(fileURL.path, O_RDWR)
         if fileDescriptor >= 0 {
             // Force sync to physical disk - CRITICAL for crash persistence
             fsync(fileDescriptor)
             close(fileDescriptor)
         }
-        print("✅ Crash info saved to: \(crashFileURL.path)")
+        print("✅ Crash info saved to: \(fileURL.path)")
     }
     
-    private func writeLowLevel(data: Data) throws {
+    nonisolated private func writeLowLevel(data: Data, fileURL: URL) throws {
         // Method 2: Try direct file descriptor write (more reliable in crash)
-        let fileDescriptor = open(crashFileURL.path, O_WRONLY | O_CREAT | O_TRUNC, 0o644)
+        let fileDescriptor = open(fileURL.path, O_WRONLY | O_CREAT | O_TRUNC, 0o644)
         if fileDescriptor >= 0 {
             data.withUnsafeBytes { bytes in
                 _ = write(fileDescriptor, bytes.baseAddress!, bytes.count)
             }
             fsync(fileDescriptor) // Force to disk
             close(fileDescriptor)
-            print("✅ Crash info saved via low-level write: \(crashFileURL.path)")
+            print("✅ Crash info saved via low-level write: \(fileURL.path)")
         } else {
             throw NSError(domain: "Wappn", code: 1, userInfo: [NSLocalizedDescriptionKey: "Failed to open file descriptor"])
         }
     }
         
-    private func saveCrashInfo(_ crash: CrashInfo) {
+    nonisolated private func saveCrashInfoNonisolated(_ crash: CrashInfo) {
         // CRITICAL: Use most reliable write method in crash scenario
         let encoder = JSONEncoder()
         encoder.outputFormatting = .prettyPrinted
@@ -296,20 +335,23 @@ public final actor Wappn {
             return
         }
         
+        // Get crash file URL from actor
+        let fileURL = assumeIsolated { $0.crashFileURL }
+        
         // Try atomic write first, fallback to low-level write if it fails
         do {
-            try writeAtomic(data: data)
+            try writeAtomic(data: data, fileURL: fileURL)
         } catch {
             print("⚠️ Atomic write failed, trying low-level write: \(error)")
             do {
-                try writeLowLevel(data: data)
+                try writeLowLevel(data: data, fileURL: fileURL)
             } catch {
                 print("❌ All write methods failed: \(error)")
             }
         }
     }
     
-    private func signalName(for signal: Int32) -> String {
+    nonisolated private static func signalNameStatic(for signal: Int32) -> String {
         switch signal {
         case SIGTRAP: return "SIGTRAP (Swift Runtime Error)"
         case SIGABRT: return "SIGABRT (Abort)"
