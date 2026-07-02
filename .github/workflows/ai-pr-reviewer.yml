@@ -1,0 +1,92 @@
+name: AI PR Reviewer
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  pull-requests: write
+  contents: read
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    if: github.event.sender.type != 'Bot'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get PR diff
+        id: diff
+        run: |
+          git diff origin/${{ github.base_ref }}...HEAD > pr_diff.txt
+          if [ ! -s pr_diff.txt ]; then
+            echo "No changes found. Skipping review."
+            echo "skip=true" >> $GITHUB_OUTPUT
+          else
+            echo "Diff size: $(wc -l < pr_diff.txt) lines"
+            echo "skip=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Review with Mistral
+        if: steps.diff.outputs.skip == 'false'
+        env:
+          MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          MAX_CHARS=16000
+          RAW_DIFF=$(cat pr_diff.txt)
+          DIFF_LEN=${#RAW_DIFF}
+          
+          DIFF=$(echo "$RAW_DIFF" | head -c $MAX_CHARS)
+          
+          TRUNCATED_WARNING=""
+          if [ $DIFF_LEN -gt $MAX_CHARS ]; then
+            TRUNCATED_WARNING="> [!WARNING]\n> The diff was truncated to $MAX_CHARS characters for the review. Some changes might not have been analyzed.\n\n"
+          fi
+
+          DISCLAIMER="> [!NOTE]\n> This is an AI-generated review. Please verify all suggestions before merging.\n\n"
+
+          PAYLOAD=$(jq -n \
+            --arg diff "$DIFF" \
+            '{
+              model: "mistral-large-latest",
+              messages: [
+                {
+                  role: "system",
+                  content: "You are an expert code reviewer. Review the following git diff and provide:\n1. A brief summary of the changes\n2. Potential issues or bugs\n3. Suggestions for improvement\n4. Overall assessment\n\nBe concise and actionable. Use markdown formatting."
+                },
+                {
+                  role: "user",
+                  content: ("Please review this pull request diff:\n\n```diff\n" + $diff + "\n```")
+                }
+              ]
+            }')
+
+          set +x 
+          RESPONSE=$(curl -s --retry 3 -X POST https://api.mistral.ai/v1/chat/completions \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer $MISTRAL_API_KEY" \
+            -d "$PAYLOAD")
+          
+          if echo "$RESPONSE" | jq -e '.error' > /dev/null; then
+            ERROR_MSG=$(echo "$RESPONSE" | jq -r '.error.message')
+            REVIEW="❌ Mistral API Error: $ERROR_MSG"
+          else
+            REVIEW=$(echo "$RESPONSE" | jq -r '.choices[0].message.content // "Error: no response from Mistral"')
+          fi
+
+          FULL_BODY="$DISCLAIMER$TRUNCATED_WARNING$REVIEW"
+          
+          # Create a Review using the Review API
+          jq -n --arg body "$FULL_BODY" '{body: $body, event: "COMMENT"}' > review_payload.json
+          
+          curl -s --retry 3 -X POST \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "Content-Type: application/json" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/$REPO/pulls/$PR_NUMBER/reviews \
+            -d @review_payload.json
