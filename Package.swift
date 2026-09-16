@@ -6,7 +6,8 @@ import PackageDescription
 let package = Package(
     name: "Wappn"
     , platforms: [
-        .iOS(.v26)
+        .iOS(.v26),
+        .macOS(.v14)
     ]
     , products: [
         // Products define the executables and libraries a package produces, making them visible to other packages.
