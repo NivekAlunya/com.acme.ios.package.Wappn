@@ -1,0 +1,129 @@
+name: Antigravity PR Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: antigravity-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout PR Branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch Target Base Branch
+        run: |
+          git fetch origin ${{ github.base_ref }}:refs/remotes/origin/${{ github.base_ref }}
+
+      - name: Generate PR Diff & Review
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY || secrets.ANTIGRAVITY_API_KEY }}
+          PR_BASE: "origin/${{ github.base_ref }}"
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          # 0. Verify API Key presence
+          if [ -z "$GEMINI_API_KEY" ]; then
+            echo "::warning ::Neither GEMINI_API_KEY nor ANTIGRAVITY_API_KEY secret is configured in this repository."
+            echo "To enable automated PR reviews, add GEMINI_API_KEY (or ANTIGRAVITY_API_KEY) under Repository Settings -> Secrets and variables -> Actions."
+            exit 0
+          fi
+
+          # 1. Compute git diff against target branch
+          git diff "$PR_BASE...HEAD" > pr_diff.patch
+
+          if [ ! -s pr_diff.patch ]; then
+            echo "<!-- antigravity-pr-reviewer -->" > review.md
+            echo "### 🤖 Antigravity PR Review" >> review.md
+            echo "No code changes detected in this pull request." >> review.md
+            exit 0
+          fi
+
+          # 2. Guard against massive diffs (truncate to 1500 lines)
+          DIFF_LINES=$(wc -l < pr_diff.patch)
+          if [ "$DIFF_LINES" -gt 1500 ]; then
+            head -n 1500 pr_diff.patch > prompt_diff.patch
+            echo -e "\n\n... [Diff truncated: exceeded 1500 lines] ..." >> prompt_diff.patch
+          else
+            cp pr_diff.patch prompt_diff.patch
+          fi
+
+          # 3. Assemble review prompt
+          cat << 'EOF' > system_prompt.txt
+          You are a Senior DevOps & Principal Software Engineer reviewing a GitHub PR.
+          Provide a concise, high-signal code review covering:
+          1. 🛡️ Security: Hardcoded secrets, credential leaks, injection risks.
+          2. ⚠️ Logic & Reliability: Error handling, edge cases, breaking changes.
+          3. ⚡ Performance & Scalability: Inefficient loops, resource leaks.
+          4. 🧪 Testing & CI/CD: Missing tests or pipeline impacts.
+
+          Format clearly in markdown with code suggestions where applicable.
+          EOF
+
+          cat << EOF > full_prompt.txt
+          $(cat system_prompt.txt)
+
+          Pull Request: "${PR_TITLE}" (#${PR_NUMBER})
+
+          Git Diff:
+          \`\`\`diff
+          $(cat prompt_diff.patch)
+          \`\`\`
+          EOF
+
+          # 4. Create JSON payload cleanly with jq
+          jq -n --rawfile text full_prompt.txt '
+            {
+              contents: [{ parts: [{ text: $text }] }],
+              generationConfig: { temperature: 0.2 }
+            }
+          ' > request.json
+
+          # 5. Call Gemini 3.7 Flash directly
+          HTTP_STATUS=$(curl -s -o response.json -w "%{http_code}" \
+            -H "Content-Type: application/json" \
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent?key=${GEMINI_API_KEY}" \
+            -d @request.json)
+
+          if [ "$HTTP_STATUS" -ne 200 ]; then
+            echo "❌ API request failed with HTTP $HTTP_STATUS:"
+            cat response.json
+            exit 1
+          fi
+
+          # 6. Extract response and build markdown review
+          echo "<!-- antigravity-pr-reviewer -->" > review.md
+          echo "### 🤖 Antigravity Automated Code Review" >> review.md
+          echo "" >> review.md
+          jq -r '.candidates[0].content.parts[0].text // "Review completed with no findings."' response.json >> review.md
+          echo "" >> review.md
+          echo "---" >> review.md
+          echo "*Reviewed by Antigravity Agent on commit \`${GITHUB_SHA:0:7}\`*" >> review.md
+
+      - name: Post or Update PR Comment
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          COMMENT_ID=$(gh api repos/${{ github.repository }}/issues/$PR_NUMBER/comments \
+            --jq '.[] | select(.body | contains("<!-- antigravity-pr-reviewer -->")) | .id' | head -n 1)
+
+          if [ -n "$COMMENT_ID" ]; then
+            echo "Updating existing comment ID: $COMMENT_ID..."
+            gh api --method PATCH repos/${{ github.repository }}/issues/comments/$COMMENT_ID \
+              -F body=@review.md
+          else
+            echo "Posting new PR review comment..."
+            gh pr comment $PR_NUMBER --body-file review.md
+          fi

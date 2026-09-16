@@ -1,15 +1,22 @@
 import Foundation
 
 // MARK: - Crash Info
-/// Represents detailed information about a crash event.
-public struct CrashInfo: Codable, Sendable {
+/// Represents detailed information about a crash event, including stack traces and system diagnostics.
+public struct CrashInfo: Codable, Sendable, CustomStringConvertible {
+    /// The exact timestamp when the crash occurred.
     public let timestamp: Date
+    /// A human-readable description of the crash cause or exception reason.
     public let reason: String
+    /// The captured stack trace symbol list at the moment of the crash.
     public let callStack: [String]
+    /// Optional signal diagnostic string (e.g., "SIGTRAP", "SIGSEGV").
     public let signalInfo: String?
+    /// The short version string of the host application.
     public let appVersion: String
+    /// The operating system version string on the host device.
     public let osVersion: String
     
+    /// A human-readable multi-line summary of the crash report.
     public var description: String {
         var desc = "=== CRASH REPORT ===\n"
         desc += "Timestamp: \(timestamp)\n"
@@ -35,15 +42,14 @@ public final class Wappn: @unchecked Sendable {
     private var capturedOutput: [String] = []
     private let maxLogCapacity = 1000 // Maximum number of log lines to keep
     private var crashInfo: CrashInfo?
-    private let queue = DispatchQueue(label: "com.wappn.interceptor", attributes: .concurrent)
     private let lock = NSLock() // For thread-safe access to mutable properties
     private var originalStdout: Int32 = -1
     private var pipe: [Int32] = [-1, -1]
     private var isIntercepting = false
     
     // Crash storage keys
-    private let crashFileURL: URL
-    private let tombstoneURL: URL
+    internal let crashFileURL: URL
+    internal let tombstoneURL: URL
     
     // Cached metadata for signal-safe access
     nonisolated(unsafe) private static var _appVersion: String = "Unknown"
@@ -72,12 +78,16 @@ public final class Wappn: @unchecked Sendable {
     
     // MARK: - Public Methods
     
-    /// Check if app crashed in previous session
+    /// Checks if the app crashed in a previous session.
+    ///
+    /// - Returns: `true` if a crash marker file exists on disk, `false` otherwise.
     public func didCrashLastTime() -> Bool {
         return FileManager.default.fileExists(atPath: crashFileURL.path)
     }
     
-    /// Get crash info from previous session
+    /// Retrieves the decoded crash report from the previous session, if one was recorded.
+    ///
+    /// - Returns: The previously recorded `CrashInfo`, or `nil` if no crash occurred.
     public func getLastCrashInfo() -> CrashInfo? {
         // Try to load from file first (most detailed)
         if let data = try? Data(contentsOf: crashFileURL),
@@ -88,17 +98,19 @@ public final class Wappn: @unchecked Sendable {
         return nil
     }
     
-    /// Clear crash marker - call after handling previous crash
+    /// Clears the persisted crash marker file. Call this after handling a previous crash report.
     public func clearCrashMarker() {
         try? FileManager.default.removeItem(at: crashFileURL)
     }
     
-    /// Mark app as successfully launched
+    /// Marks the current application launch as successful by clearing any pending crash markers.
     public func markLaunchSuccess() {
         clearCrashMarker()
     }
     
-    /// Get the path where crash files are stored
+    /// Returns the filesystem path where the crash report JSON is persisted.
+    ///
+    /// - Returns: The absolute path string to the crash report file.
     public func getCrashFilePath() -> String {
         return crashFileURL.path
     }
@@ -128,7 +140,7 @@ public final class Wappn: @unchecked Sendable {
         let pipeReadEnd = pipe[0]
         let originalStdoutCopy = originalStdout
         
-        queue.async { [weak self] in
+        Task.detached(priority: .utility) { [weak self] in
             self?.readFromPipe(pipeReadEnd: pipeReadEnd, originalStdout: originalStdoutCopy)
         }
         
@@ -149,17 +161,20 @@ public final class Wappn: @unchecked Sendable {
         dup2(originalStdout, STDOUT_FILENO)
         close(originalStdout)
         close(pipe[0])
+        originalStdout = -1
+        pipe = [-1, -1]
         
         isIntercepting = false
     }
     
     /// Returns all captured output strings.
     ///
+    /// This method is synchronized and safe to call concurrently from any thread.
     /// - Returns: An array of strings captured from stdout.
     public func getCapturedOutput() -> [String] {
-        return queue.sync {
-            return capturedOutput
-        }
+        lock.lock()
+        defer { lock.unlock() }
+        return capturedOutput
     }
     
     /// Returns the crash info if a crash has been detected in the current session.
@@ -181,7 +196,7 @@ public final class Wappn: @unchecked Sendable {
     }
     
     /// Recovers crash info from a tombstone file if one exists.
-    private func recoverFromTombstone() {
+    internal func recoverFromTombstone() {
         guard FileManager.default.fileExists(atPath: tombstoneURL.path) else { return }
         
         do {
@@ -222,7 +237,7 @@ public final class Wappn: @unchecked Sendable {
     }
     
     // MARK: - Signal Safe Storage
-    nonisolated(unsafe) private static var tombstonePathCStr: [Int8] = []
+    nonisolated(unsafe) private static var tombstonePathPointer: UnsafeMutablePointer<CChar>?
     
     // MARK: - Private Methods
     
@@ -272,8 +287,12 @@ public final class Wappn: @unchecked Sendable {
             Wappn.shared.handleCrash(crash)
         }
         
-        // Prepare tombstone path for signal handler
-        Wappn.tombstonePathCStr = tombstoneURL.path.cString(using: .utf8) ?? []
+        // Prepare pre-allocated tombstone path for signal handler
+        if let existing = Wappn.tombstonePathPointer {
+            free(existing)
+            Wappn.tombstonePathPointer = nil
+        }
+        Wappn.tombstonePathPointer = strdup(tombstoneURL.path)
         
         // Signal handlers for fatal signals
         let signals: [Int32] = [SIGTRAP, SIGABRT, SIGILL, SIGSEGV, SIGFPE, SIGBUS, SIGPIPE, SIGXCPU, SIGXFSZ, SIGSYS]
@@ -293,28 +312,27 @@ public final class Wappn: @unchecked Sendable {
     /// Low-level, async-signal-safe signal handler.
     /// Calls ONLY async-signal-safe functions. No Swift runtime, no allocations.
     private static func handleSignal(_ sig: Int32) {
-        let path = tombstonePathCStr
-        if !path.isEmpty {
+        if let path = tombstonePathPointer {
             let fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0o644)
             if fd >= 0 {
-                _ = write(fd, "SIGNAL:", 7)
+                safeWrite(fd, "SIGNAL:")
                 
-                // Write signal name or number safely
+                // Write signal name safely using static string literals
                 switch sig {
-                case SIGTRAP: _ = write(fd, "SIGTRAP", 7)
-                case SIGABRT: _ = write(fd, "SIGABRT", 7)
-                case SIGILL: _ = write(fd, "SIGILL", 6)
-                case SIGSEGV: _ = write(fd, "SIGSEGV", 7)
-                case SIGFPE: _ = write(fd, "SIGFPE", 6)
-                case SIGBUS: _ = write(fd, "SIGBUS", 6)
-                case SIGPIPE: _ = write(fd, "SIGPIPE", 7)
-                case SIGXCPU: _ = write(fd, "SIGXCPU", 7)
-                case SIGXFSZ: _ = write(fd, "SIGXFSZ", 7)
-                case SIGSYS: _ = write(fd, "SIGSYS", 6)
-                default: _ = write(fd, "UNKNOWN", 7)
+                case SIGTRAP: safeWrite(fd, "SIGTRAP")
+                case SIGABRT: safeWrite(fd, "SIGABRT")
+                case SIGILL: safeWrite(fd, "SIGILL")
+                case SIGSEGV: safeWrite(fd, "SIGSEGV")
+                case SIGFPE: safeWrite(fd, "SIGFPE")
+                case SIGBUS: safeWrite(fd, "SIGBUS")
+                case SIGPIPE: safeWrite(fd, "SIGPIPE")
+                case SIGXCPU: safeWrite(fd, "SIGXCPU")
+                case SIGXFSZ: safeWrite(fd, "SIGXFSZ")
+                case SIGSYS: safeWrite(fd, "SIGSYS")
+                default: safeWrite(fd, "UNKNOWN")
                 }
                 
-                _ = write(fd, "\nTIME:0\n", 8)
+                safeWrite(fd, "\nTIME:0\n")
                 
                 // Flush and close
                 fsync(fd)
@@ -326,6 +344,15 @@ public final class Wappn: @unchecked Sendable {
         // We reset to default first to avoid infinite recursion.
         Darwin.signal(sig, SIG_DFL)
         Darwin.raise(sig)
+    }
+
+    /// Async-signal-safe write using static string literals in read-only memory.
+    private static func safeWrite(_ fd: Int32, _ string: StaticString) {
+        string.withUTF8Buffer { buffer in
+            if let baseAddress = buffer.baseAddress, buffer.count > 0 {
+                _ = write(fd, baseAddress, buffer.count)
+            }
+        }
     }
     
     private func handleCrash(_ crash: CrashInfo) {
@@ -358,8 +385,7 @@ public final class Wappn: @unchecked Sendable {
         sync() // Force all pending disk writes
     }
     
-
-    private func saveCrashInfo(_ crash: CrashInfo) {
+    internal func saveCrashInfo(_ crash: CrashInfo) {
         // CRITICAL: Use most reliable write method in crash scenario
         let encoder = JSONEncoder()
         encoder.outputFormatting = .prettyPrinted
@@ -407,7 +433,11 @@ public final class Wappn: @unchecked Sendable {
         print("✅ Crash info saved via low-level write: \(crashFileURL.path)")
     }
     
-    private func signalName(for signal: Int32) -> String {
+    /// Returns a descriptive name for a standard POSIX fatal signal.
+    ///
+    /// - Parameter signal: The POSIX signal integer (e.g., `SIGSEGV`, `SIGTRAP`).
+    /// - Returns: A descriptive string representation of the signal.
+    public static func signalName(for signal: Int32) -> String {
         switch signal {
         case SIGTRAP: return "SIGTRAP (Swift Runtime Error)"
         case SIGABRT: return "SIGABRT (Abort)"
@@ -436,6 +466,39 @@ public enum LogLevel: String {
 }
 
 #if !DEBUG
+@inlinable
+@inline(__always)
+#endif
+/// Formats a timestamp with microsecond precision (`HH:mm:ss.SSSSSS`).
+/// - Parameter date: An optional `Date` to format. If `nil`, current time with microsecond precision is used.
+/// - Returns: A formatted string representing time with microseconds.
+public func formatTimestampWithMicroseconds(_ date: Date? = nil) -> String {
+    var tv = timeval()
+    if let date {
+        let timeInterval = date.timeIntervalSince1970
+        tv.tv_sec = time_t(timeInterval)
+        let fractional = timeInterval - Double(tv.tv_sec)
+        var usec = Int(round(fractional * 1_000_000))
+        if usec >= 1_000_000 {
+            tv.tv_sec += 1
+            usec = 0
+        }
+        tv.tv_usec = suseconds_t(max(0, usec))
+    } else {
+        gettimeofday(&tv, nil)
+    }
+    var tmVal = tm()
+    localtime_r(&tv.tv_sec, &tmVal)
+    var buffer = [CChar](repeating: 0, count: 32)
+    strftime(&buffer, buffer.count, "%H:%M:%S", &tmVal)
+    let timeStr = buffer.withUnsafeBufferPointer { ptr in
+        ptr.baseAddress.map { String(cString: $0) } ?? ""
+    }
+    let microseconds = String(format: "%06d", tv.tv_usec)
+    return "\(timeStr).\(microseconds)"
+}
+
+#if !DEBUG
     @inlinable
     @inline(__always)
 #endif
@@ -459,7 +522,7 @@ public func log(_ level: LogLevel,
     #if DEBUG
     let fileName = (file as NSString).lastPathComponent
     let output = items.map { "\($0)" }.joined(separator: separator)
-    let timestamp = DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .medium)
+    let timestamp = formatTimestampWithMicroseconds()
     let logMessage = "[\(timestamp)] [\(level.rawValue)] [\(fileName):\(line) \(function)] - \(output)"
     print(logMessage, terminator: terminator)
     #endif
