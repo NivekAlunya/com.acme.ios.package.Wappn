@@ -520,13 +520,25 @@ public func log(_ level: LogLevel,
                 line: Int = #line,
                 function: String = #function) {
     #if DEBUG
+    logItems(level, items, separator: separator, terminator: terminator, file: file, line: line, function: function)
+    #endif
+}
+
+#if DEBUG
+func logItems(_ level: LogLevel,
+              _ items: [Any],
+              separator: String,
+              terminator: String,
+              file: String,
+              line: Int,
+              function: String) {
     let fileName = (file as NSString).lastPathComponent
     let output = items.map { "\($0)" }.joined(separator: separator)
     let timestamp = formatTimestampWithMicroseconds()
     let logMessage = "[\(timestamp)] [\(level.rawValue)] [\(fileName):\(line) \(function)] - \(output)"
     print(logMessage, terminator: terminator)
-    #endif
 }
+#endif
 
 #if !DEBUG
 @inlinable
@@ -545,8 +557,7 @@ public func logd(_ items: Any...,
                  line: Int = #line,
                  function: String = #function) {
     #if DEBUG
-    let output = items.map { "\($0)" }.joined(separator: separator)
-    log(.debug, output, terminator: terminator, file: file, line: line, function: function)
+    logItems(.debug, items, separator: separator, terminator: terminator, file: file, line: line, function: function)
     #endif
 }
 
@@ -567,8 +578,7 @@ public func logi(_ items: Any...,
                  line: Int = #line,
                  function: String = #function) {
     #if DEBUG
-    let output = items.map { "\($0)" }.joined(separator: separator)
-    log(.info, output, terminator: terminator, file: file, line: line, function: function)
+    logItems(.info, items, separator: separator, terminator: terminator, file: file, line: line, function: function)
     #endif
 }
 
@@ -589,8 +599,7 @@ public func logw(_ items: Any...,
                  line: Int = #line,
                  function: String = #function) {
     #if DEBUG
-    let output = items.map { "\($0)" }.joined(separator: separator)
-    log(.warning, output, terminator: terminator, file: file, line: line, function: function)
+    logItems(.warning, items, separator: separator, terminator: terminator, file: file, line: line, function: function)
     #endif
 }
 
@@ -611,8 +620,7 @@ public func loge(_ items: Any...,
                  line: Int = #line,
                  function: String = #function) {
     #if DEBUG
-    let output = items.map { "\($0)" }.joined(separator: separator)
-    log(.error, output, terminator: terminator, file: file, line: line, function: function)
+    logItems(.error, items, separator: separator, terminator: terminator, file: file, line: line, function: function)
     #endif
 }
 #if !DEBUG
@@ -632,8 +640,7 @@ public func logv(_ items: Any...,
                  line: Int = #line,
                  function: String = #function) {
     #if DEBUG
-    let output = items.map { "\($0)" }.joined(separator: separator)
-    log(.verbose, output, terminator: terminator, file: file, line: line, function: function)
+    logItems(.verbose, items, separator: separator, terminator: terminator, file: file, line: line, function: function)
     #endif
 }
 
