@@ -93,7 +93,7 @@ jobs:
           # 5. Call Gemini 3.7 Flash directly
           HTTP_STATUS=$(curl -s -o response.json -w "%{http_code}" \
             -H "Content-Type: application/json" \
-            "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent?key=${GEMINI_API_KEY}" \
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.7-flash:generateContent?key=${GEMINI_API_KEY}" \
             -d @request.json)
 
           if [ "$HTTP_STATUS" -ne 200 ]; then
