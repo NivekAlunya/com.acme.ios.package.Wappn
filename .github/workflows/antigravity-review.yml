@@ -29,18 +29,19 @@ jobs:
       - name: Generate PR Diff & Review
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY || secrets.ANTIGRAVITY_API_KEY }}
+          GEMINI_MODEL: ${{ vars.GEMINI_MODEL || 'gemini-3.7-flash' }}
           PR_BASE: "origin/${{ github.base_ref }}"
           PR_TITLE: ${{ github.event.pull_request.title }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
-          # 0. Verify API Key presence
+          # Precondition 1: Verify API Key presence
           if [ -z "$GEMINI_API_KEY" ]; then
             echo "::warning ::Neither GEMINI_API_KEY nor ANTIGRAVITY_API_KEY secret is configured in this repository."
             echo "To enable automated PR reviews, add GEMINI_API_KEY (or ANTIGRAVITY_API_KEY) under Repository Settings -> Secrets and variables -> Actions."
             exit 0
           fi
 
-          # 1. Compute git diff against target branch
+          # Precondition 2: Compute git diff against target branch
           git diff "$PR_BASE...HEAD" > pr_diff.patch
 
           if [ ! -s pr_diff.patch ]; then
@@ -50,7 +51,7 @@ jobs:
             exit 0
           fi
 
-          # 2. Guard against massive diffs (truncate to 1500 lines)
+          # Precondition 3: Guard against massive diffs (truncate to 1500 lines)
           DIFF_LINES=$(wc -l < pr_diff.patch)
           if [ "$DIFF_LINES" -gt 1500 ]; then
             head -n 1500 pr_diff.patch > prompt_diff.patch
@@ -59,7 +60,7 @@ jobs:
             cp pr_diff.patch prompt_diff.patch
           fi
 
-          # 3. Assemble review prompt
+          # Assemble review prompt
           cat << 'EOF' > system_prompt.txt
           You are a Senior DevOps & Principal Software Engineer reviewing a GitHub PR.
           Provide a concise, high-signal code review covering:
@@ -82,7 +83,7 @@ jobs:
           \`\`\`
           EOF
 
-          # 4. Create JSON payload cleanly with jq
+          # Create JSON payload cleanly with jq
           jq -n --rawfile text full_prompt.txt '
             {
               contents: [{ parts: [{ text: $text }] }],
@@ -90,32 +91,62 @@ jobs:
             }
           ' > request.json
 
-          # 5. Call Gemini 3.7 Flash directly
-          HTTP_STATUS=$(curl -s -o response.json -w "%{http_code}" \
-            -H "Content-Type: application/json" \
-            "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.7-flash:generateContent?key=${GEMINI_API_KEY}" \
-            -d @request.json)
+          # Call Gemini API with progressive delay (attempt * 15s) for 429 and 503
+          MAX_RETRIES=5
+          SUCCESS=false
 
-          if [ "$HTTP_STATUS" -ne 200 ]; then
-            echo "❌ API request failed with HTTP $HTTP_STATUS:"
+          # Initial jitter (0-5s) to avoid burst collision when multiple packages trigger concurrently
+          sleep $((RANDOM % 6))
+
+          for attempt in $(seq 1 $MAX_RETRIES); do
+            echo "Calling Gemini API with model '${GEMINI_MODEL}' (attempt $attempt of $MAX_RETRIES)..."
+            HTTP_STATUS=$(curl -s -o response.json -w "%{http_code}" \
+              -H "Content-Type: application/json" \
+              "https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}" \
+              -d @request.json)
+
+            if [ "$HTTP_STATUS" -eq 200 ]; then
+              SUCCESS=true
+              break
+            elif [ "$HTTP_STATUS" -eq 429 ] || [ "$HTTP_STATUS" -eq 503 ]; then
+              if [ "$attempt" -lt "$MAX_RETRIES" ]; then
+                RETRY_DELAY=$((attempt * 15))
+                echo "⚠️ HTTP $HTTP_STATUS received (High Demand / Rate Limited). Retrying in ${RETRY_DELAY}s (attempt $attempt of $MAX_RETRIES)..."
+                sleep $RETRY_DELAY
+              fi
+            else
+              echo "❌ API request failed with unrecoverable HTTP $HTTP_STATUS:"
+              cat response.json
+              exit 1
+            fi
+          done
+
+          if [ "$SUCCESS" != "true" ]; then
+            echo "❌ Gemini API request failed after $MAX_RETRIES attempts (last HTTP status: $HTTP_STATUS):"
             cat response.json
             exit 1
           fi
 
-          # 6. Extract response and build markdown review
+          # Extract response and build markdown review
           echo "<!-- antigravity-pr-reviewer -->" > review.md
           echo "### 🤖 Antigravity Automated Code Review" >> review.md
           echo "" >> review.md
           jq -r '.candidates[0].content.parts[0].text // "Review completed with no findings."' response.json >> review.md
           echo "" >> review.md
           echo "---" >> review.md
-          echo "*Reviewed by Antigravity Agent on commit \`${GITHUB_SHA:0:7}\`*" >> review.md
+          echo "*Reviewed by Antigravity Agent using \`${GEMINI_MODEL}\` on commit \`${GITHUB_SHA:0:7}\`*" >> review.md
 
       - name: Post or Update PR Comment
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
+          # Guard: skip comment posting if review.md was not generated (e.g. missing API key)
+          if [ ! -f review.md ]; then
+            echo "No review.md file found. Skipping comment posting."
+            exit 0
+          fi
+
           COMMENT_ID=$(gh api repos/${{ github.repository }}/issues/$PR_NUMBER/comments \
             --jq '.[] | select(.body | contains("<!-- antigravity-pr-reviewer -->")) | .id' | head -n 1)
 
