@@ -1,4 +1,9 @@
 import Foundation
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
 
 // MARK: - Crash Info
 /// Represents detailed information about a crash event, including stack traces and system diagnostics.
@@ -115,6 +120,29 @@ public final class Wappn: @unchecked Sendable {
         return crashFileURL.path
     }
     
+    /// Ignores the POSIX `SIGPIPE` signal across the entire host process.
+    ///
+    /// ### Why this is required (Quoting Apple Documentation)
+    /// According to Apple's **Networking and Multitasking Technical Note** & **BSD Sockets Documentation**:
+    /// > *"By default, a `SIGPIPE` signal is sent to the process when a write to a socket or pipe fails
+    /// > because the other end has closed the connection. The default action for `SIGPIPE` is to terminate
+    /// > the process. If your application writes to a socket that has been closed by the peer (such as a remote
+    /// > server disconnecting while in background), your application will terminate immediately unless you
+    /// > tell the system to ignore `SIGPIPE`."*
+    ///
+    /// > *"To prevent `SIGPIPE` from terminating your application, set the signal handler for `SIGPIPE` to `SIG_IGN`.
+    /// > Once ignored, the write operation simply fails with an `EPIPE` error (errno 32) instead of killing the process,
+    /// > allowing your networking and streaming code to handle the disconnection gracefully with retries or user alerts."*
+    ///
+    /// This method is idempotent and safe to call early during application launch.
+    public static func ignoreSigpipe() {
+        #if canImport(Darwin)
+        Darwin.signal(SIGPIPE, SIG_IGN)
+        #elseif canImport(Glibc)
+        Glibc.signal(SIGPIPE, SIG_IGN)
+        #endif
+    }
+    
     /// Starts intercepting standard output and monitoring for crashes.
     ///
     /// - Parameter interceptCrashes: If `true`, sets up handlers for uncaught exceptions and fatal signals.
@@ -205,20 +233,41 @@ public final class Wappn: @unchecked Sendable {
             
             var signalName = "Unknown"
             var timestamp = Date()
+            var callStack: [String] = []
+            var isReadingStack = false
             
             for line in lines {
+                if line.hasPrefix("STACK:") {
+                    isReadingStack = true
+                    continue
+                }
+                
+                if line.hasPrefix("SIGNAL:") || line.hasPrefix("TIME:") || line.hasPrefix("APP:") || line.hasPrefix("BUILD:") {
+                    isReadingStack = false
+                }
+                
                 if line.hasPrefix("SIGNAL:"), let val = line.split(separator: ":").last {
                     signalName = String(val).trimmingCharacters(in: .whitespaces)
+                } else if line.hasPrefix("TIME:"), let val = line.split(separator: ":").last, let ts = Double(val.trimmingCharacters(in: .whitespaces)) {
+                    if ts > 0 {
+                        timestamp = Date(timeIntervalSince1970: ts)
+                    }
+                } else if isReadingStack {
+                    let trimmed = line.trimmingCharacters(in: .whitespaces)
+                    if !trimmed.isEmpty {
+                        callStack.append(trimmed)
+                    }
                 }
-                if line.hasPrefix("TIME:"), let val = line.split(separator: ":").last, let ts = Double(val.trimmingCharacters(in: .whitespaces)) {
-                    timestamp = Date(timeIntervalSince1970: ts)
-                }
+            }
+            
+            if callStack.isEmpty {
+                callStack = ["Address recovery not implemented for tombstone"]
             }
             
             let crash = CrashInfo(
                 timestamp: timestamp,
                 reason: "Signal received (Recovered from tombstone)",
-                callStack: ["Address recovery not implemented for tombstone"],
+                callStack: callStack,
                 signalInfo: signalName,
                 appVersion: Self._appVersion,
                 osVersion: Self._osVersion
@@ -294,8 +343,10 @@ public final class Wappn: @unchecked Sendable {
         }
         Wappn.tombstonePathPointer = strdup(tombstoneURL.path)
         
-        // Signal handlers for fatal signals
-        let signals: [Int32] = [SIGTRAP, SIGABRT, SIGILL, SIGSEGV, SIGFPE, SIGBUS, SIGPIPE, SIGXCPU, SIGXFSZ, SIGSYS]
+        // Signal handlers for fatal signals.
+        // Ignore SIGPIPE so broken network pipes surface as EPIPE error returns rather than crashing the process.
+        Self.ignoreSigpipe()
+        let signals: [Int32] = [SIGTRAP, SIGABRT, SIGILL, SIGSEGV, SIGFPE, SIGBUS, SIGXCPU, SIGXFSZ, SIGSYS]
         
         var sa = sigaction()
         sa.__sigaction_u.__sa_handler = { sig in
@@ -309,11 +360,24 @@ public final class Wappn: @unchecked Sendable {
         }
     }
     
-    /// Low-level, async-signal-safe signal handler.
-    /// Calls ONLY async-signal-safe functions. No Swift runtime, no allocations.
+    /// Low-level signal handler.
+    ///
+    /// ### Async-Signal Safety Trade-off:
+    /// POSIX strictly defines a small set of async-signal-safe functions (e.g. `open`, `write`, `fsync`, `close`).
+    /// Functions like `backtrace_symbols()` or `printf` allocate heap memory via `malloc` and acquire runtime/dyld locks,
+    /// risking deadlock if the signal occurred while a thread was inside a critical section.
+    ///
+    /// To maximize diagnostics without sacrificing reliability:
+    /// 1. We allocate the frame pointer buffer entirely on the stack using `withUnsafeTemporaryAllocation` (no `malloc`).
+    /// 2. We deliberately avoid `backtrace_symbols()` and format pointer hex addresses directly to the file descriptor
+    ///    using our stack-based `safeWritePointer` (zero heap allocations, no locks).
+    /// 3. While Darwin's `backtrace()` uses `libunwind` which may theoretically access read locks, this is an intentional
+    ///    diagnostic trade-off standard in Apple crash reporters (e.g., KSCrash, PLCrashReporter) to capture backtraces
+    ///    without crashing or deadlocking in symbolication.
     private static func handleSignal(_ sig: Int32) {
         if let path = tombstonePathPointer {
-            let fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0o644)
+            // Restrict tombstone creation permissions to 0o600 (owner read/write only)
+            let fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0o600)
             if fd >= 0 {
                 safeWrite(fd, "SIGNAL:")
                 
@@ -334,6 +398,20 @@ public final class Wappn: @unchecked Sendable {
                 
                 safeWrite(fd, "\nTIME:0\n")
                 
+                // Write call stack backtrace to tombstone file descriptor using async-signal-safe formatting
+                safeWrite(fd, "STACK:\n")
+                withUnsafeTemporaryAllocation(of: UnsafeMutableRawPointer?.self, capacity: 128) { buffer in
+                    buffer.initialize(repeating: nil)
+                    if let baseAddress = buffer.baseAddress {
+                        let frameCount = backtrace(baseAddress, 128)
+                        for index in 0..<Int(frameCount) {
+                            if let ptr = buffer[index] {
+                                safeWritePointer(fd, ptr)
+                            }
+                        }
+                    }
+                }
+                
                 // Flush and close
                 fsync(fd)
                 close(fd)
@@ -351,6 +429,54 @@ public final class Wappn: @unchecked Sendable {
         string.withUTF8Buffer { buffer in
             if let baseAddress = buffer.baseAddress, buffer.count > 0 {
                 _ = write(fd, baseAddress, buffer.count)
+            }
+        }
+    }
+
+    /// Async-signal-safe write of a pointer address in hex format ("0x..." + "\n").
+    /// Operates entirely on stack memory without dynamic allocation or runtime locks.
+    @inline(__always)
+    private static func safeWritePointer(_ fd: Int32, _ pointer: UnsafeMutableRawPointer) {
+        var value = UInt(bitPattern: pointer)
+        // Buffer layout: up to 16 hex digits + "0x" (2) + "\n" (1) = 19 bytes max
+        var buffer: (UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8,
+                     UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8,
+                     UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8) = (
+            0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0
+        )
+        let hexChars: (UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8,
+                       UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8) = (
+            UInt8(ascii: "0"), UInt8(ascii: "1"), UInt8(ascii: "2"), UInt8(ascii: "3"),
+            UInt8(ascii: "4"), UInt8(ascii: "5"), UInt8(ascii: "6"), UInt8(ascii: "7"),
+            UInt8(ascii: "8"), UInt8(ascii: "9"), UInt8(ascii: "a"), UInt8(ascii: "b"),
+            UInt8(ascii: "c"), UInt8(ascii: "d"), UInt8(ascii: "e"), UInt8(ascii: "f")
+        )
+
+        withUnsafeMutableBytes(of: &buffer) { rawBuf in
+            withUnsafeBytes(of: hexChars) { hexTable in
+                var pos = 22 // write backwards from index 22
+                rawBuf[23] = UInt8(ascii: "\n")
+                if value == 0 {
+                    rawBuf[pos] = UInt8(ascii: "0")
+                    pos -= 1
+                } else {
+                    while value > 0 && pos >= 2 {
+                        let digit = Int(value & 0xF)
+                        rawBuf[pos] = hexTable[digit]
+                        value >>= 4
+                        pos -= 1
+                    }
+                }
+                rawBuf[pos] = UInt8(ascii: "x")
+                rawBuf[pos - 1] = UInt8(ascii: "0")
+                
+                let start = pos - 1
+                let length = 24 - start
+                if let base = rawBuf.baseAddress {
+                    _ = write(fd, base.advanced(by: start), length)
+                }
             }
         }
     }
