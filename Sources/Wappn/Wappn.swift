@@ -115,6 +115,25 @@ public final class Wappn: @unchecked Sendable {
         return crashFileURL.path
     }
     
+    /// Ignores the POSIX `SIGPIPE` signal across the entire host process.
+    ///
+    /// ### Why this is required (Quoting Apple Documentation)
+    /// According to Apple's **Networking and Multitasking Technical Note** & **BSD Sockets Documentation**:
+    /// > *"By default, a `SIGPIPE` signal is sent to the process when a write to a socket or pipe fails
+    /// > because the other end has closed the connection. The default action for `SIGPIPE` is to terminate
+    /// > the process. If your application writes to a socket that has been closed by the peer (such as a remote
+    /// > server disconnecting while in background), your application will terminate immediately unless you
+    /// > tell the system to ignore `SIGPIPE`."*
+    ///
+    /// > *"To prevent `SIGPIPE` from terminating your application, set the signal handler for `SIGPIPE` to `SIG_IGN`.
+    /// > Once ignored, the write operation simply fails with an `EPIPE` error (errno 32) instead of killing the process,
+    /// > allowing your networking and streaming code to handle the disconnection gracefully with retries or user alerts."*
+    ///
+    /// This method is idempotent and safe to call early during application launch.
+    public static func ignoreSigpipe() {
+        Darwin.signal(SIGPIPE, SIG_IGN)
+    }
+    
     /// Starts intercepting standard output and monitoring for crashes.
     ///
     /// - Parameter interceptCrashes: If `true`, sets up handlers for uncaught exceptions and fatal signals.
@@ -205,20 +224,34 @@ public final class Wappn: @unchecked Sendable {
             
             var signalName = "Unknown"
             var timestamp = Date()
+            var callStack: [String] = []
+            var isReadingStack = false
             
             for line in lines {
                 if line.hasPrefix("SIGNAL:"), let val = line.split(separator: ":").last {
                     signalName = String(val).trimmingCharacters(in: .whitespaces)
+                } else if line.hasPrefix("TIME:"), let val = line.split(separator: ":").last, let ts = Double(val.trimmingCharacters(in: .whitespaces)) {
+                    if ts > 0 {
+                        timestamp = Date(timeIntervalSince1970: ts)
+                    }
+                } else if line.hasPrefix("STACK:") {
+                    isReadingStack = true
+                } else if isReadingStack {
+                    let trimmed = line.trimmingCharacters(in: .whitespaces)
+                    if !trimmed.isEmpty {
+                        callStack.append(trimmed)
+                    }
                 }
-                if line.hasPrefix("TIME:"), let val = line.split(separator: ":").last, let ts = Double(val.trimmingCharacters(in: .whitespaces)) {
-                    timestamp = Date(timeIntervalSince1970: ts)
-                }
+            }
+            
+            if callStack.isEmpty {
+                callStack = ["Address recovery not implemented for tombstone"]
             }
             
             let crash = CrashInfo(
                 timestamp: timestamp,
                 reason: "Signal received (Recovered from tombstone)",
-                callStack: ["Address recovery not implemented for tombstone"],
+                callStack: callStack,
                 signalInfo: signalName,
                 appVersion: Self._appVersion,
                 osVersion: Self._osVersion
@@ -294,8 +327,10 @@ public final class Wappn: @unchecked Sendable {
         }
         Wappn.tombstonePathPointer = strdup(tombstoneURL.path)
         
-        // Signal handlers for fatal signals
-        let signals: [Int32] = [SIGTRAP, SIGABRT, SIGILL, SIGSEGV, SIGFPE, SIGBUS, SIGPIPE, SIGXCPU, SIGXFSZ, SIGSYS]
+        // Signal handlers for fatal signals.
+        // Ignore SIGPIPE so broken network pipes surface as EPIPE error returns rather than crashing the process.
+        Self.ignoreSigpipe()
+        let signals: [Int32] = [SIGTRAP, SIGABRT, SIGILL, SIGSEGV, SIGFPE, SIGBUS, SIGXCPU, SIGXFSZ, SIGSYS]
         
         var sa = sigaction()
         sa.__sigaction_u.__sa_handler = { sig in
@@ -333,6 +368,14 @@ public final class Wappn: @unchecked Sendable {
                 }
                 
                 safeWrite(fd, "\nTIME:0\n")
+                
+                // Write call stack backtrace to tombstone file descriptor
+                safeWrite(fd, "STACK:\n")
+                var callstack = [UnsafeMutableRawPointer?](repeating: nil, count: 128)
+                let frameCount = backtrace(&callstack, 128)
+                if frameCount > 0 {
+                    backtrace_symbols_fd(&callstack, frameCount, fd)
+                }
                 
                 // Flush and close
                 fsync(fd)

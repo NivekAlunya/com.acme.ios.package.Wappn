@@ -85,8 +85,8 @@ struct WappnTests {
         let wappn = Wappn.shared
         wappn.clearCrashMarker()
         
-        // Write mock tombstone
-        let tombstoneContent = "SIGNAL:SIGSEGV\nTIME:1710000000\n"
+        // Write mock tombstone with stack frames
+        let tombstoneContent = "SIGNAL:SIGSEGV\nTIME:1710000000\nSTACK:\n0   WappnTests  0x0000000100001000 foo + 16\n1   WappnTests  0x0000000100002000 bar + 32\n"
         try tombstoneContent.write(to: wappn.tombstoneURL, atomically: true, encoding: .utf8)
         #expect(FileManager.default.fileExists(atPath: wappn.tombstoneURL.path))
         
@@ -102,6 +102,8 @@ struct WappnTests {
         #expect(recovered != nil)
         #expect(recovered?.signalInfo == "SIGSEGV")
         #expect(recovered?.reason.contains("Recovered from tombstone") == true)
+        #expect(recovered?.callStack.count == 2)
+        #expect(recovered?.callStack.first?.contains("0x0000000100001000") == true)
         
         // Clean up
         wappn.clearCrashMarker()
