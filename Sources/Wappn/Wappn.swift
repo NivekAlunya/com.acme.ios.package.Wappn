@@ -237,9 +237,14 @@ public final class Wappn: @unchecked Sendable {
                 } else if line.hasPrefix("STACK:") {
                     isReadingStack = true
                 } else if isReadingStack {
-                    let trimmed = line.trimmingCharacters(in: .whitespaces)
-                    if !trimmed.isEmpty {
-                        callStack.append(trimmed)
+                    // Stop reading stack if another section header (e.g. "FOO:") is encountered
+                    if line.contains(":") && !line.hasPrefix("0x") {
+                        isReadingStack = false
+                    } else {
+                        let trimmed = line.trimmingCharacters(in: .whitespaces)
+                        if !trimmed.isEmpty {
+                            callStack.append(trimmed)
+                        }
                     }
                 }
             }
@@ -348,7 +353,8 @@ public final class Wappn: @unchecked Sendable {
     /// Calls ONLY async-signal-safe functions. No Swift runtime, no allocations.
     private static func handleSignal(_ sig: Int32) {
         if let path = tombstonePathPointer {
-            let fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0o644)
+            // Restrict tombstone creation permissions to 0o600 (owner read/write only)
+            let fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0o600)
             if fd >= 0 {
                 safeWrite(fd, "SIGNAL:")
                 
@@ -369,12 +375,14 @@ public final class Wappn: @unchecked Sendable {
                 
                 safeWrite(fd, "\nTIME:0\n")
                 
-                // Write call stack backtrace to tombstone file descriptor
+                // Write call stack backtrace to tombstone file descriptor using async-signal-safe formatting
                 safeWrite(fd, "STACK:\n")
                 var callstack = [UnsafeMutableRawPointer?](repeating: nil, count: 128)
                 let frameCount = backtrace(&callstack, 128)
-                if frameCount > 0 {
-                    backtrace_symbols_fd(&callstack, frameCount, fd)
+                for index in 0..<Int(frameCount) {
+                    if let ptr = callstack[index] {
+                        safeWritePointer(fd, ptr)
+                    }
                 }
                 
                 // Flush and close
@@ -394,6 +402,54 @@ public final class Wappn: @unchecked Sendable {
         string.withUTF8Buffer { buffer in
             if let baseAddress = buffer.baseAddress, buffer.count > 0 {
                 _ = write(fd, baseAddress, buffer.count)
+            }
+        }
+    }
+
+    /// Async-signal-safe write of a pointer address in hex format ("0x..." + "\n").
+    /// Operates entirely on stack memory without dynamic allocation or runtime locks.
+    private static func safeWritePointer(_ fd: Int32, _ pointer: UnsafeMutableRawPointer) {
+        var value = UInt(bitPattern: pointer)
+        // Buffer size: "0x" (2) + up to 16 hex digits (16) + "\n" (1) = 19 bytes max
+        var buffer: (UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8,
+                     UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8,
+                     UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8) = (
+            0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0
+        )
+        let hexChars: (UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8,
+                       UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8) = (
+            UInt8(ascii: "0"), UInt8(ascii: "1"), UInt8(ascii: "2"), UInt8(ascii: "3"),
+            UInt8(ascii: "4"), UInt8(ascii: "5"), UInt8(ascii: "6"), UInt8(ascii: "7"),
+            UInt8(ascii: "8"), UInt8(ascii: "9"), UInt8(ascii: "a"), UInt8(ascii: "b"),
+            UInt8(ascii: "c"), UInt8(ascii: "d"), UInt8(ascii: "e"), UInt8(ascii: "f")
+        )
+
+        withUnsafeMutableBytes(of: &buffer) { rawBuf in
+            withUnsafeBytes(of: hexChars) { hexTable in
+                var pos = 22 // write backwards from second-to-last index
+                rawBuf[23] = UInt8(ascii: "\n")
+                if value == 0 {
+                    rawBuf[pos] = UInt8(ascii: "0")
+                    pos -= 1
+                } else {
+                    while value > 0 && pos >= 2 {
+                        let digit = Int(value & 0xF)
+                        rawBuf[pos] = hexTable[digit]
+                        value >>= 4
+                        pos -= 1
+                    }
+                }
+                rawBuf[pos] = UInt8(ascii: "x")
+                pos -= 1
+                rawBuf[pos] = UInt8(ascii: "0")
+                
+                let start = pos
+                let length = 24 - start
+                if let base = rawBuf.baseAddress {
+                    _ = write(fd, base.advanced(by: start), length)
+                }
             }
         }
     }

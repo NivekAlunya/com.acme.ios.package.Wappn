@@ -143,4 +143,25 @@ struct WappnTests {
         #expect(dateParts.count == 2)
         #expect(dateParts[1] == "123456")
     }
+
+    @Test("ignoreSigpipe suppresses SIGPIPE and allows write on broken pipe to return EPIPE")
+    func ignoreSigpipePreventsCrashOnBrokenPipe() throws {
+        Wappn.ignoreSigpipe()
+        
+        var fds: [Int32] = [0, 0]
+        guard pipe(&fds) == 0 else {
+            Issue.record("Failed to create pipe")
+            return
+        }
+        
+        // Close read end so write will encounter a broken pipe
+        close(fds[0])
+        
+        let message = "test"
+        let result = write(fds[1], message, message.utf8.count)
+        #expect(result == -1)
+        #expect(errno == EPIPE)
+        
+        close(fds[1])
+    }
 }
