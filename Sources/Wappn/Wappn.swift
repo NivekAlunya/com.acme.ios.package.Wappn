@@ -237,8 +237,8 @@ public final class Wappn: @unchecked Sendable {
                 } else if line.hasPrefix("STACK:") {
                     isReadingStack = true
                 } else if isReadingStack {
-                    // Stop reading stack if another section header (e.g. "FOO:") is encountered
-                    if line.contains(":") && !line.hasPrefix("0x") {
+                    // Stop reading stack if another known top-level tombstone section begins
+                    if line.hasPrefix("SIGNAL:") || line.hasPrefix("TIME:") || line.hasPrefix("APP:") || line.hasPrefix("BUILD:") {
                         isReadingStack = false
                     } else {
                         let trimmed = line.trimmingCharacters(in: .whitespaces)
@@ -377,11 +377,15 @@ public final class Wappn: @unchecked Sendable {
                 
                 // Write call stack backtrace to tombstone file descriptor using async-signal-safe formatting
                 safeWrite(fd, "STACK:\n")
-                var callstack = [UnsafeMutableRawPointer?](repeating: nil, count: 128)
-                let frameCount = backtrace(&callstack, 128)
-                for index in 0..<Int(frameCount) {
-                    if let ptr = callstack[index] {
-                        safeWritePointer(fd, ptr)
+                withUnsafeTemporaryAllocation(of: UnsafeMutableRawPointer?.self, capacity: 128) { buffer in
+                    buffer.initialize(repeating: nil)
+                    if let baseAddress = buffer.baseAddress {
+                        let frameCount = backtrace(baseAddress, 128)
+                        for index in 0..<Int(frameCount) {
+                            if let ptr = buffer[index] {
+                                safeWritePointer(fd, ptr)
+                            }
+                        }
                     }
                 }
                 
@@ -410,7 +414,7 @@ public final class Wappn: @unchecked Sendable {
     /// Operates entirely on stack memory without dynamic allocation or runtime locks.
     private static func safeWritePointer(_ fd: Int32, _ pointer: UnsafeMutableRawPointer) {
         var value = UInt(bitPattern: pointer)
-        // Buffer size: "0x" (2) + up to 16 hex digits (16) + "\n" (1) = 19 bytes max
+        // Buffer layout: up to 16 hex digits + "0x" (2) + "\n" (1) = 19 bytes max
         var buffer: (UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8,
                      UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8,
                      UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8) = (
@@ -428,7 +432,7 @@ public final class Wappn: @unchecked Sendable {
 
         withUnsafeMutableBytes(of: &buffer) { rawBuf in
             withUnsafeBytes(of: hexChars) { hexTable in
-                var pos = 22 // write backwards from second-to-last index
+                var pos = 22 // write backwards from index 22
                 rawBuf[23] = UInt8(ascii: "\n")
                 if value == 0 {
                     rawBuf[pos] = UInt8(ascii: "0")
@@ -442,10 +446,9 @@ public final class Wappn: @unchecked Sendable {
                     }
                 }
                 rawBuf[pos] = UInt8(ascii: "x")
-                pos -= 1
-                rawBuf[pos] = UInt8(ascii: "0")
+                rawBuf[pos - 1] = UInt8(ascii: "0")
                 
-                let start = pos
+                let start = pos - 1
                 let length = 24 - start
                 if let base = rawBuf.baseAddress {
                     _ = write(fd, base.advanced(by: start), length)
