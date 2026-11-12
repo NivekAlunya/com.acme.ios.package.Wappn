@@ -1,4 +1,9 @@
 import Foundation
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
 
 // MARK: - Crash Info
 /// Represents detailed information about a crash event, including stack traces and system diagnostics.
@@ -131,7 +136,11 @@ public final class Wappn: @unchecked Sendable {
     ///
     /// This method is idempotent and safe to call early during application launch.
     public static func ignoreSigpipe() {
+        #if canImport(Darwin)
         Darwin.signal(SIGPIPE, SIG_IGN)
+        #elseif canImport(Glibc)
+        Glibc.signal(SIGPIPE, SIG_IGN)
+        #endif
     }
     
     /// Starts intercepting standard output and monitoring for crashes.
@@ -426,6 +435,7 @@ public final class Wappn: @unchecked Sendable {
 
     /// Async-signal-safe write of a pointer address in hex format ("0x..." + "\n").
     /// Operates entirely on stack memory without dynamic allocation or runtime locks.
+    @inline(__always)
     private static func safeWritePointer(_ fd: Int32, _ pointer: UnsafeMutableRawPointer) {
         var value = UInt(bitPattern: pointer)
         // Buffer layout: up to 16 hex digits + "0x" (2) + "\n" (1) = 19 bytes max
