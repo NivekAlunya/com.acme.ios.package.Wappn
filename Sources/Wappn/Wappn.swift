@@ -228,23 +228,25 @@ public final class Wappn: @unchecked Sendable {
             var isReadingStack = false
             
             for line in lines {
+                if line.hasPrefix("STACK:") {
+                    isReadingStack = true
+                    continue
+                }
+                
+                if line.hasPrefix("SIGNAL:") || line.hasPrefix("TIME:") || line.hasPrefix("APP:") || line.hasPrefix("BUILD:") {
+                    isReadingStack = false
+                }
+                
                 if line.hasPrefix("SIGNAL:"), let val = line.split(separator: ":").last {
                     signalName = String(val).trimmingCharacters(in: .whitespaces)
                 } else if line.hasPrefix("TIME:"), let val = line.split(separator: ":").last, let ts = Double(val.trimmingCharacters(in: .whitespaces)) {
                     if ts > 0 {
                         timestamp = Date(timeIntervalSince1970: ts)
                     }
-                } else if line.hasPrefix("STACK:") {
-                    isReadingStack = true
                 } else if isReadingStack {
-                    // Stop reading stack if another known top-level tombstone section begins
-                    if line.hasPrefix("SIGNAL:") || line.hasPrefix("TIME:") || line.hasPrefix("APP:") || line.hasPrefix("BUILD:") {
-                        isReadingStack = false
-                    } else {
-                        let trimmed = line.trimmingCharacters(in: .whitespaces)
-                        if !trimmed.isEmpty {
-                            callStack.append(trimmed)
-                        }
+                    let trimmed = line.trimmingCharacters(in: .whitespaces)
+                    if !trimmed.isEmpty {
+                        callStack.append(trimmed)
                     }
                 }
             }
@@ -349,8 +351,20 @@ public final class Wappn: @unchecked Sendable {
         }
     }
     
-    /// Low-level, async-signal-safe signal handler.
-    /// Calls ONLY async-signal-safe functions. No Swift runtime, no allocations.
+    /// Low-level signal handler.
+    ///
+    /// ### Async-Signal Safety Trade-off:
+    /// POSIX strictly defines a small set of async-signal-safe functions (e.g. `open`, `write`, `fsync`, `close`).
+    /// Functions like `backtrace_symbols()` or `printf` allocate heap memory via `malloc` and acquire runtime/dyld locks,
+    /// risking deadlock if the signal occurred while a thread was inside a critical section.
+    ///
+    /// To maximize diagnostics without sacrificing reliability:
+    /// 1. We allocate the frame pointer buffer entirely on the stack using `withUnsafeTemporaryAllocation` (no `malloc`).
+    /// 2. We deliberately avoid `backtrace_symbols()` and format pointer hex addresses directly to the file descriptor
+    ///    using our stack-based `safeWritePointer` (zero heap allocations, no locks).
+    /// 3. While Darwin's `backtrace()` uses `libunwind` which may theoretically access read locks, this is an intentional
+    ///    diagnostic trade-off standard in Apple crash reporters (e.g., KSCrash, PLCrashReporter) to capture backtraces
+    ///    without crashing or deadlocking in symbolication.
     private static func handleSignal(_ sig: Int32) {
         if let path = tombstonePathPointer {
             // Restrict tombstone creation permissions to 0o600 (owner read/write only)
