@@ -68,6 +68,9 @@ public final class Wappn: @unchecked Sendable {
     public var onCrash: (@Sendable (CrashInfo) -> Void)?
     
     private init() {
+        // Suppress SIGPIPE as early as possible so broken pipes/sockets never terminate the process
+        Self.ignoreSigpipe()
+        
         // Setup crash file path
         let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
         crashFileURL = documents.appendingPathComponent("last_crash.json")
@@ -375,6 +378,12 @@ public final class Wappn: @unchecked Sendable {
     ///    diagnostic trade-off standard in Apple crash reporters (e.g., KSCrash, PLCrashReporter) to capture backtraces
     ///    without crashing or deadlocking in symbolication.
     private static func handleSignal(_ sig: Int32) {
+        // Never treat SIGPIPE as a fatal crash; ignore it to allow sockets/pipes to return EPIPE
+        if sig == SIGPIPE {
+            Self.ignoreSigpipe()
+            return
+        }
+        
         if let path = tombstonePathPointer {
             // Restrict tombstone creation permissions to 0o600 (owner read/write only)
             let fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0o600)
