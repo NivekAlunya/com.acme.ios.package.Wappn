@@ -233,7 +233,6 @@ public final class Wappn: @unchecked Sendable {
 
         do {
             let content = try String(contentsOf: tombstoneURL, encoding: .utf8)
-
             var signalName = "Unknown"
             var timestamp = Date()
             var imageName: String?
@@ -243,18 +242,15 @@ public final class Wappn: @unchecked Sendable {
             var slideAddress: UInt = 0
             var rawFrames: [String] = []
             var isReadingStack = false
-
             for rawLine in content.split(separator: "\n", omittingEmptySubsequences: false) {
                 let line = rawLine.trimmingCharacters(in: .whitespaces)
                 if line == "STACK:" || line.hasPrefix("STACK:") {
                     isReadingStack = true
                     continue
                 }
-
                 if line.hasPrefix("SIGNAL:") || line.hasPrefix("TIME:") || line.hasPrefix("APP:") || line.hasPrefix("BUILD:") || line.hasPrefix("BASE:") || line.hasPrefix("END:") || line.hasPrefix("SLIDE:") || line.hasPrefix("IMAGE:") || line.hasPrefix("UUID:") {
                     isReadingStack = false
                 }
-
                 if let value = Self.headerValue(in: line, prefix: "SIGNAL:") {
                     signalName = value
                 } else if let value = Self.headerValue(in: line, prefix: "TIME:"), let ts = Double(value), ts > 0 {
@@ -284,7 +280,6 @@ public final class Wappn: @unchecked Sendable {
                 let slideHex = "0x" + String(slideAddress, radix: 16)
                 callStack.append("Load Address: \(baseHex) (Slide: \(slideHex))")
             }
-
             let hasValidBounds = baseAddress > 0 && endAddress > baseAddress
             var appFrames: [String] = []
             let formattedFrames = rawFrames.map { frame -> String in
@@ -334,7 +329,6 @@ public final class Wappn: @unchecked Sendable {
             print("❌ Failed to recover from tombstone: \(error)")
         }
     }
-
     internal static func parseHexUInt(_ string: String) -> UInt? {
         let stripped = string.hasPrefix("0x") || string.hasPrefix("0X")
             ? String(string.dropFirst(2))
@@ -347,7 +341,6 @@ public final class Wappn: @unchecked Sendable {
         guard line.hasPrefix(prefix) else { return nil }
         return line.dropFirst(prefix.count).trimmingCharacters(in: .whitespaces)
     }
-
     // MARK: - Signal Safe Storage
     nonisolated(unsafe) private static var tombstonePathPointer: UnsafeMutablePointer<CChar>?
     nonisolated(unsafe) private static var mainImageBaseAddress: UInt = 0
@@ -563,7 +556,6 @@ public final class Wappn: @unchecked Sendable {
         var cmdPtr = UnsafeRawPointer(header).advanced(by: MemoryLayout<mach_header_64>.size)
         var foundUUID: String?
         var textVMSize: UInt = 0
-
         for _ in 0..<header64.pointee.ncmds {
             let cmd = cmdPtr.assumingMemoryBound(to: load_command.self).pointee
             guard cmd.cmdsize >= MemoryLayout<load_command>.size else { break }
