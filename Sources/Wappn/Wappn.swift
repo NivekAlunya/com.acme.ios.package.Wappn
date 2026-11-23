@@ -233,48 +233,44 @@ public final class Wappn: @unchecked Sendable {
         
         do {
             let content = try String(contentsOf: tombstoneURL, encoding: .utf8)
-            let lines = content.components(separatedBy: "\n")
             
             var signalName = "Unknown"
             var timestamp = Date()
             var imageName: String?
             var imageUUID: String?
             var baseAddress: UInt = 0
+            var endAddress: UInt = 0
             var slideAddress: UInt = 0
             var rawFrames: [String] = []
             var isReadingStack = false
             
-            for line in lines {
-                if line.hasPrefix("STACK:") {
+            for rawLine in content.split(separator: "\n", omittingEmptySubsequences: false) {
+                let line = rawLine.trimmingCharacters(in: .whitespaces)
+                if line == "STACK:" || line.hasPrefix("STACK:") {
                     isReadingStack = true
                     continue
                 }
                 
-                if line.hasPrefix("SIGNAL:") || line.hasPrefix("TIME:") || line.hasPrefix("APP:") || line.hasPrefix("BUILD:") || line.hasPrefix("BASE:") || line.hasPrefix("SLIDE:") || line.hasPrefix("IMAGE:") || line.hasPrefix("UUID:") {
+                if line.hasPrefix("SIGNAL:") || line.hasPrefix("TIME:") || line.hasPrefix("APP:") || line.hasPrefix("BUILD:") || line.hasPrefix("BASE:") || line.hasPrefix("END:") || line.hasPrefix("SLIDE:") || line.hasPrefix("IMAGE:") || line.hasPrefix("UUID:") {
                     isReadingStack = false
                 }
                 
-                if line.hasPrefix("SIGNAL:"), let val = line.split(separator: ":", maxSplits: 1).last {
-                    signalName = String(val).trimmingCharacters(in: .whitespaces)
-                } else if line.hasPrefix("TIME:"), let val = line.split(separator: ":", maxSplits: 1).last, let ts = Double(val.trimmingCharacters(in: .whitespaces)) {
-                    if ts > 0 {
-                        timestamp = Date(timeIntervalSince1970: ts)
-                    }
-                } else if line.hasPrefix("BASE:"), let val = line.split(separator: ":", maxSplits: 1).last {
-                    baseAddress = Self.parseHexUInt(String(val).trimmingCharacters(in: .whitespaces)) ?? 0
-                } else if line.hasPrefix("SLIDE:"), let val = line.split(separator: ":", maxSplits: 1).last {
-                    slideAddress = Self.parseHexUInt(String(val).trimmingCharacters(in: .whitespaces)) ?? 0
-                } else if line.hasPrefix("IMAGE:"), let val = line.split(separator: ":", maxSplits: 1).last {
-                    let trimmed = String(val).trimmingCharacters(in: .whitespaces)
-                    if !trimmed.isEmpty { imageName = trimmed }
-                } else if line.hasPrefix("UUID:"), let val = line.split(separator: ":", maxSplits: 1).last {
-                    let trimmed = String(val).trimmingCharacters(in: .whitespaces)
-                    if !trimmed.isEmpty { imageUUID = trimmed }
-                } else if isReadingStack {
-                    let trimmed = line.trimmingCharacters(in: .whitespaces)
-                    if !trimmed.isEmpty {
-                        rawFrames.append(trimmed)
-                    }
+                if let value = Self.headerValue(in: line, prefix: "SIGNAL:") {
+                    signalName = value
+                } else if let value = Self.headerValue(in: line, prefix: "TIME:"), let ts = Double(value), ts > 0 {
+                    timestamp = Date(timeIntervalSince1970: ts)
+                } else if let value = Self.headerValue(in: line, prefix: "BASE:") {
+                    baseAddress = Self.parseHexUInt(value) ?? 0
+                } else if let value = Self.headerValue(in: line, prefix: "END:") {
+                    endAddress = Self.parseHexUInt(value) ?? 0
+                } else if let value = Self.headerValue(in: line, prefix: "SLIDE:") {
+                    slideAddress = Self.parseHexUInt(value) ?? 0
+                } else if let value = Self.headerValue(in: line, prefix: "IMAGE:"), !value.isEmpty {
+                    imageName = value
+                } else if let value = Self.headerValue(in: line, prefix: "UUID:"), !value.isEmpty {
+                    imageUUID = value
+                } else if isReadingStack, !line.isEmpty {
+                    rawFrames.append(line)
                 }
             }
             
@@ -289,10 +285,16 @@ public final class Wappn: @unchecked Sendable {
                 callStack.append("Load Address: \(baseHex) (Slide: \(slideHex))")
             }
             
+            let hasValidBounds = baseAddress > 0 && endAddress > baseAddress
+            var appFrames: [String] = []
             let formattedFrames = rawFrames.map { frame -> String in
-                guard baseAddress > 0, let addr = Self.parseHexUInt(frame), addr >= baseAddress else {
+                guard hasValidBounds,
+                      let addr = Self.parseHexUInt(frame),
+                      addr >= baseAddress,
+                      addr < endAddress else {
                     return frame
                 }
+                appFrames.append(frame)
                 let offset = addr - baseAddress
                 let label = imageName ?? "Image"
                 return "\(frame) (\(label) + 0x\(String(offset, radix: 16)))"
@@ -304,9 +306,11 @@ public final class Wappn: @unchecked Sendable {
                 callStack.append(contentsOf: formattedFrames)
                 if baseAddress > 0 {
                     let baseHex = "0x" + String(baseAddress, radix: 16)
-                    let binaryName = imageName ?? "<Binary>"
-                    let addrs = rawFrames.joined(separator: " ")
-                    callStack.append("Symbolicate: atos -arch arm64 -o \(binaryName).app/\(binaryName) -l \(baseHex) \(addrs)")
+                    let binaryName = imageName ?? "Binary"
+                    let appPath = "\(binaryName).app/\(binaryName)"
+                    let escapedPath = appPath.replacingOccurrences(of: "'", with: "'\\''")
+                    let addrs = (appFrames.isEmpty ? rawFrames : appFrames).joined(separator: " ")
+                    callStack.append("Symbolicate: atos -arch arm64 -o '\(escapedPath)' -l \(baseHex) \(addrs)")
                 }
             }
             
@@ -331,16 +335,23 @@ public final class Wappn: @unchecked Sendable {
         }
     }
     
-    private static func parseHexUInt(_ string: String) -> UInt? {
+    internal static func parseHexUInt(_ string: String) -> UInt? {
         let stripped = string.hasPrefix("0x") || string.hasPrefix("0X")
             ? String(string.dropFirst(2))
             : string
+        guard !stripped.isEmpty else { return nil }
         return UInt(stripped, radix: 16)
+    }
+
+    private static func headerValue(in line: String, prefix: String) -> String? {
+        guard line.hasPrefix(prefix) else { return nil }
+        return line.dropFirst(prefix.count).trimmingCharacters(in: .whitespaces)
     }
     
     // MARK: - Signal Safe Storage
     nonisolated(unsafe) private static var tombstonePathPointer: UnsafeMutablePointer<CChar>?
     nonisolated(unsafe) private static var mainImageBaseAddress: UInt = 0
+    nonisolated(unsafe) private static var mainImageEndAddress: UInt = 0
     nonisolated(unsafe) private static var mainImageSlide: UInt = 0
     nonisolated(unsafe) private static var mainImageNamePointer: UnsafeMutablePointer<CChar>?
     nonisolated(unsafe) private static var mainImageUUIDPointer: UnsafeMutablePointer<CChar>?
@@ -481,6 +492,10 @@ public final class Wappn: @unchecked Sendable {
                 if mainImageBaseAddress > 0 {
                     safeWrite(fd, "BASE:")
                     safeWriteHexUInt(fd, mainImageBaseAddress)
+                    if mainImageEndAddress > mainImageBaseAddress {
+                        safeWrite(fd, "END:")
+                        safeWriteHexUInt(fd, mainImageEndAddress)
+                    }
                     safeWrite(fd, "SLIDE:")
                     safeWriteHexUInt(fd, mainImageSlide)
                 }
@@ -533,27 +548,41 @@ public final class Wappn: @unchecked Sendable {
             free(existingUUID)
             mainImageUUIDPointer = nil
         }
-        if let uuidString = extractUUID(from: header) {
+        let details = extractImageDetails(from: header)
+        mainImageEndAddress = details.textVMSize > 0 ? mainImageBaseAddress &+ details.textVMSize : 0
+        if let uuidString = details.uuid {
             mainImageUUIDPointer = strdup(uuidString)
         }
         #endif
     }
     
     #if canImport(Darwin)
-    private static func extractUUID(from header: UnsafePointer<mach_header>) -> String? {
-        guard header.pointee.magic == MH_MAGIC_64 else { return nil }
+    private static func extractImageDetails(from header: UnsafePointer<mach_header>) -> (uuid: String?, textVMSize: UInt) {
+        guard header.pointee.magic == MH_MAGIC_64 else { return (nil, 0) }
         let header64 = UnsafeRawPointer(header).assumingMemoryBound(to: mach_header_64.self)
         var cmdPtr = UnsafeRawPointer(header).advanced(by: MemoryLayout<mach_header_64>.size)
+        var foundUUID: String?
+        var textVMSize: UInt = 0
+        
         for _ in 0..<header64.pointee.ncmds {
             let cmd = cmdPtr.assumingMemoryBound(to: load_command.self).pointee
+            guard cmd.cmdsize >= MemoryLayout<load_command>.size else { break }
             if cmd.cmd == LC_UUID {
                 let uuidCmd = cmdPtr.assumingMemoryBound(to: uuid_command.self).pointee
-                let uuid = uuidCmd.uuid
-                return UUID(uuid: uuid).uuidString
+                foundUUID = UUID(uuid: uuidCmd.uuid).uuidString
+            } else if cmd.cmd == LC_SEGMENT_64 {
+                let segCmd = cmdPtr.assumingMemoryBound(to: segment_command_64.self).pointee
+                let isText = withUnsafeBytes(of: segCmd.segname) { raw -> Bool in
+                    guard let ptr = raw.baseAddress?.assumingMemoryBound(to: CChar.self) else { return false }
+                    return strcmp(ptr, "__TEXT") == 0
+                }
+                if isText {
+                    textVMSize = UInt(segCmd.vmsize)
+                }
             }
             cmdPtr = cmdPtr.advanced(by: Int(cmd.cmdsize))
         }
-        return nil
+        return (foundUUID, textVMSize)
     }
     #endif
 

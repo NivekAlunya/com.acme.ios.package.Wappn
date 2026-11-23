@@ -108,6 +108,49 @@ struct WappnTests {
         // Clean up
         wappn.clearCrashMarker()
     }
+
+    @Test("Tombstone recovery computes app offsets only within BASE..END and escapes atos path")
+    func tombstoneMetadataAndOffsetBounds() throws {
+        let wappn = Wappn.shared
+        wappn.clearCrashMarker()
+
+        let tombstoneContent = """
+        SIGNAL:SIGTRAP
+        TIME:1710000000
+        IMAGE:My App
+        UUID:11111111-2222-3333-4444-555555555555
+        BASE:0x104000000
+        END:0x104100000
+        SLIDE:0x4000000
+        STACK:
+        0x10405e664
+        0x1a17bd21c
+        """
+        try tombstoneContent.write(to: wappn.tombstoneURL, atomically: true, encoding: .utf8)
+
+        wappn.recoverFromTombstone()
+        defer { wappn.clearCrashMarker() }
+
+        let recovered = try #require(wappn.getLastCrashInfo())
+        #expect(recovered.signalInfo == "SIGTRAP")
+        #expect(recovered.callStack.contains("Binary: My App (UUID: 11111111-2222-3333-4444-555555555555)"))
+        #expect(recovered.callStack.contains("Load Address: 0x104000000 (Slide: 0x4000000)"))
+        #expect(recovered.callStack.contains("0x10405e664 (My App + 0x5e664)"))
+        #expect(recovered.callStack.contains("0x1a17bd21c"))
+        #expect(!recovered.callStack.contains { $0.contains("0x1a17bd21c (My App") })
+        #expect(recovered.callStack.contains("Symbolicate: atos -arch arm64 -o 'My App.app/My App' -l 0x104000000 0x10405e664"))
+    }
+
+    @Test("parseHexUInt handles prefixes, empty strings, and invalid characters")
+    func parseHexUIntEdgeCases() {
+        #expect(Wappn.parseHexUInt("0x104000000") == 0x104000000)
+        #expect(Wappn.parseHexUInt("0XFF") == 0xFF)
+        #expect(Wappn.parseHexUInt("deadbeef") == 0xDEADBEEF)
+        #expect(Wappn.parseHexUInt("") == nil)
+        #expect(Wappn.parseHexUInt("0x") == nil)
+        #expect(Wappn.parseHexUInt("0xZZZZ") == nil)
+        #expect(Wappn.parseHexUInt("0xFFFFFFFFFFFFFFFFF") == nil)
+    }
     
     @Test("Log capture and buffer management")
     func outputCaptureAndClearing() {
