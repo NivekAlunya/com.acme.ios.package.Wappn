@@ -21,7 +21,7 @@ public struct CrashInfo: Codable, Sendable, CustomStringConvertible {
     public let appVersion: String
     /// The operating system version string on the host device.
     public let osVersion: String
-    
+
     /// A human-readable multi-line summary of the crash report.
     public var description: String {
         var desc = "=== CRASH REPORT ===\n"
@@ -44,7 +44,7 @@ public struct CrashInfo: Codable, Sendable, CustomStringConvertible {
 /// Use `Wappn.shared` to access the singleton instance.
 public final class Wappn: @unchecked Sendable {
     public static let shared = Wappn()
-    
+
     private var capturedOutput: [String] = []
     private let maxLogCapacity = 1000 // Maximum number of log lines to keep
     private var crashInfo: CrashInfo?
@@ -52,48 +52,48 @@ public final class Wappn: @unchecked Sendable {
     private var originalStdout: Int32 = -1
     private var pipe: [Int32] = [-1, -1]
     private var isIntercepting = false
-    
+
     // Crash storage keys
     internal let crashFileURL: URL
     internal let tombstoneURL: URL
-    
+
     // Cached metadata for signal-safe access
     nonisolated(unsafe) private static var _appVersion: String = "Unknown"
     nonisolated(unsafe) private static var _osVersion: String = "Unknown"
-    
+
     // Crash handler callback
     /// Callback triggered when a crash occurs.
     ///
     /// This closure is called just before the app terminates due to a crash.
     /// You can use this to save critical data, but keep the operation short.
     public var onCrash: (@Sendable (CrashInfo) -> Void)?
-    
+
     private init() {
         // Suppress SIGPIPE as early as possible so broken pipes/sockets never terminate the process
         Self.ignoreSigpipe()
-        
+
         // Setup crash file path
         let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
         crashFileURL = documents.appendingPathComponent("last_crash.json")
         tombstoneURL = documents.appendingPathComponent("crash_tombstone.txt")
-        
+
         // Cache metadata at startup (safe to do here)
         Self._appVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "Unknown"
         Self._osVersion = ProcessInfo.processInfo.operatingSystemVersionString
-        
+
         // Check for pending tombstone from previous crash
         recoverFromTombstone()
     }
-    
+
     // MARK: - Public Methods
-    
+
     /// Checks if the app crashed in a previous session.
     ///
     /// - Returns: `true` if a crash marker file exists on disk, `false` otherwise.
     public func didCrashLastTime() -> Bool {
         return FileManager.default.fileExists(atPath: crashFileURL.path)
     }
-    
+
     /// Retrieves the decoded crash report from the previous session, if one was recorded.
     ///
     /// - Returns: The previously recorded `CrashInfo`, or `nil` if no crash occurred.
@@ -103,27 +103,27 @@ public final class Wappn: @unchecked Sendable {
            let crash = try? JSONDecoder().decode(CrashInfo.self, from: data) {
             return crash
         }
-                
+
         return nil
     }
-    
+
     /// Clears the persisted crash marker file. Call this after handling a previous crash report.
     public func clearCrashMarker() {
         try? FileManager.default.removeItem(at: crashFileURL)
     }
-    
+
     /// Marks the current application launch as successful by clearing any pending crash markers.
     public func markLaunchSuccess() {
         clearCrashMarker()
     }
-    
+
     /// Returns the filesystem path where the crash report JSON is persisted.
     ///
     /// - Returns: The absolute path string to the crash report file.
     public func getCrashFilePath() -> String {
         return crashFileURL.path
     }
-    
+
     /// Ignores the POSIX `SIGPIPE` signal across the entire host process.
     ///
     /// ### Why this is required (Quoting Apple Documentation)
@@ -146,59 +146,59 @@ public final class Wappn: @unchecked Sendable {
         Glibc.signal(SIGPIPE, SIG_IGN)
         #endif
     }
-    
+
     /// Starts intercepting standard output and monitoring for crashes.
     ///
     /// - Parameter interceptCrashes: If `true`, sets up handlers for uncaught exceptions and fatal signals.
     public func startIntercepting(interceptCrashes: Bool = true) {
         lock.lock()
         defer { lock.unlock() }
-        
+
         guard !isIntercepting else { return }
-        
+
         // Save original stdout
         originalStdout = dup(STDOUT_FILENO)
-        
+
         // Create pipe
         Darwin.pipe(&pipe)
-        
+
         // Redirect stdout to pipe write end
         dup2(pipe[1], STDOUT_FILENO)
         close(pipe[1])
-        
+
         isIntercepting = true
-        
+
         // Start reading from pipe in background
         let pipeReadEnd = pipe[0]
         let originalStdoutCopy = originalStdout
-        
+
         Task.detached(priority: .utility) { [weak self] in
             self?.readFromPipe(pipeReadEnd: pipeReadEnd, originalStdout: originalStdoutCopy)
         }
-        
+
         // Setup crash handlers
         if interceptCrashes {
             setupCrashHandlers()
         }
     }
-    
+
     /// Stops intercepting standard output and restores the original stdout.
     public func stopIntercepting() {
         lock.lock()
         defer { lock.unlock() }
-        
+
         guard isIntercepting else { return }
-        
+
         // Restore original stdout
         dup2(originalStdout, STDOUT_FILENO)
         close(originalStdout)
         close(pipe[0])
         originalStdout = -1
         pipe = [-1, -1]
-        
+
         isIntercepting = false
     }
-    
+
     /// Returns all captured output strings.
     ///
     /// This method is synchronized and safe to call concurrently from any thread.
@@ -208,7 +208,7 @@ public final class Wappn: @unchecked Sendable {
         defer { lock.unlock() }
         return capturedOutput
     }
-    
+
     /// Returns the crash info if a crash has been detected in the current session.
     ///
     /// This is typically populated just before the app terminates.
@@ -218,7 +218,7 @@ public final class Wappn: @unchecked Sendable {
         defer { lock.unlock() }
         return crashInfo
     }
-    
+
     /// Clears all captured output and crash info.
     public func clearCapturedOutput() {
         lock.lock()
@@ -226,14 +226,13 @@ public final class Wappn: @unchecked Sendable {
         capturedOutput.removeAll()
         crashInfo = nil
     }
-    
+
     /// Recovers crash info from a tombstone file if one exists.
     internal func recoverFromTombstone() {
         guard FileManager.default.fileExists(atPath: tombstoneURL.path) else { return }
-        
+
         do {
             let content = try String(contentsOf: tombstoneURL, encoding: .utf8)
-            
             var signalName = "Unknown"
             var timestamp = Date()
             var imageName: String?
@@ -243,18 +242,15 @@ public final class Wappn: @unchecked Sendable {
             var slideAddress: UInt = 0
             var rawFrames: [String] = []
             var isReadingStack = false
-            
             for rawLine in content.split(separator: "\n", omittingEmptySubsequences: false) {
                 let line = rawLine.trimmingCharacters(in: .whitespaces)
                 if line == "STACK:" || line.hasPrefix("STACK:") {
                     isReadingStack = true
                     continue
                 }
-                
                 if line.hasPrefix("SIGNAL:") || line.hasPrefix("TIME:") || line.hasPrefix("APP:") || line.hasPrefix("BUILD:") || line.hasPrefix("BASE:") || line.hasPrefix("END:") || line.hasPrefix("SLIDE:") || line.hasPrefix("IMAGE:") || line.hasPrefix("UUID:") {
                     isReadingStack = false
                 }
-                
                 if let value = Self.headerValue(in: line, prefix: "SIGNAL:") {
                     signalName = value
                 } else if let value = Self.headerValue(in: line, prefix: "TIME:"), let ts = Double(value), ts > 0 {
@@ -266,14 +262,17 @@ public final class Wappn: @unchecked Sendable {
                 } else if let value = Self.headerValue(in: line, prefix: "SLIDE:") {
                     slideAddress = Self.parseHexUInt(value) ?? 0
                 } else if let value = Self.headerValue(in: line, prefix: "IMAGE:"), !value.isEmpty {
-                    imageName = value
+                    let sanitized = String(value.unicodeScalars.filter { !CharacterSet.controlCharacters.contains($0) })
+                    if !sanitized.isEmpty {
+                        imageName = sanitized
+                    }
                 } else if let value = Self.headerValue(in: line, prefix: "UUID:"), !value.isEmpty {
                     imageUUID = value
                 } else if isReadingStack, !line.isEmpty {
                     rawFrames.append(line)
                 }
             }
-            
+
             var callStack: [String] = []
             if let imageName {
                 let uuidPart = imageUUID.map { " (UUID: \($0))" } ?? ""
@@ -284,7 +283,6 @@ public final class Wappn: @unchecked Sendable {
                 let slideHex = "0x" + String(slideAddress, radix: 16)
                 callStack.append("Load Address: \(baseHex) (Slide: \(slideHex))")
             }
-            
             let hasValidBounds = baseAddress > 0 && endAddress > baseAddress
             var appFrames: [String] = []
             let formattedFrames = rawFrames.map { frame -> String in
@@ -299,7 +297,7 @@ public final class Wappn: @unchecked Sendable {
                 let label = imageName ?? "Image"
                 return "\(frame) (\(label) + 0x\(String(offset, radix: 16)))"
             }
-            
+
             if formattedFrames.isEmpty {
                 callStack.append("Address recovery not implemented for tombstone")
             } else {
@@ -313,7 +311,7 @@ public final class Wappn: @unchecked Sendable {
                     callStack.append("Symbolicate: atos -arch arm64 -o '\(escapedPath)' -l \(baseHex) \(addrs)")
                 }
             }
-            
+
             let crash = CrashInfo(
                 timestamp: timestamp,
                 reason: "Signal received (Recovered from tombstone)",
@@ -322,19 +320,18 @@ public final class Wappn: @unchecked Sendable {
                 appVersion: Self._appVersion,
                 osVersion: Self._osVersion
             )
-            
+
             // Save the formal crash report
             saveCrashInfo(crash)
-            
+
             // Cleanup tombstone
             try? FileManager.default.removeItem(at: tombstoneURL)
             print("✅ Recovered crash from tombstone: \(signalName)")
-            
+
         } catch {
             print("❌ Failed to recover from tombstone: \(error)")
         }
     }
-    
     internal static func parseHexUInt(_ string: String) -> UInt? {
         let stripped = string.hasPrefix("0x") || string.hasPrefix("0X")
             ? String(string.dropFirst(2))
@@ -347,7 +344,6 @@ public final class Wappn: @unchecked Sendable {
         guard line.hasPrefix(prefix) else { return nil }
         return line.dropFirst(prefix.count).trimmingCharacters(in: .whitespaces)
     }
-    
     // MARK: - Signal Safe Storage
     nonisolated(unsafe) private static var tombstonePathPointer: UnsafeMutablePointer<CChar>?
     nonisolated(unsafe) private static var mainImageBaseAddress: UInt = 0
@@ -355,27 +351,27 @@ public final class Wappn: @unchecked Sendable {
     nonisolated(unsafe) private static var mainImageSlide: UInt = 0
     nonisolated(unsafe) private static var mainImageNamePointer: UnsafeMutablePointer<CChar>?
     nonisolated(unsafe) private static var mainImageUUIDPointer: UnsafeMutablePointer<CChar>?
-    
+
     // MARK: - Private Methods
-    
+
     private func readFromPipe(pipeReadEnd: Int32, originalStdout: Int32) {
         let bufferSize = 4096
         var buffer = [UInt8](repeating: 0, count: bufferSize)
-        
+
         while true {
             lock.lock()
             let shouldContinue = isIntercepting
             lock.unlock()
-            
+
             guard shouldContinue else { break }
-            
+
             let bytesRead = read(pipeReadEnd, &buffer, bufferSize)
-            
+
             guard bytesRead > 0 else { break }
-            
+
             // Write to original stdout (so it still prints)
             _ = write(originalStdout, buffer, bytesRead)
-            
+
             // Capture the output
             if let output = String(bytes: buffer[0..<bytesRead], encoding: .utf8) {
                 lock.lock()
@@ -387,9 +383,9 @@ public final class Wappn: @unchecked Sendable {
             }
         }
     }
-    
+
     // MARK: - Crash Handling
-    
+
     private func setupCrashHandlers() {
         // NSException handler (for Objective-C exceptions)
         NSSetUncaughtExceptionHandler { exception in
@@ -403,34 +399,34 @@ public final class Wappn: @unchecked Sendable {
             )
             Wappn.shared.handleCrash(crash)
         }
-        
+
         // Prepare pre-allocated tombstone path for signal handler
         if let existing = Wappn.tombstonePathPointer {
             free(existing)
             Wappn.tombstonePathPointer = nil
         }
         Wappn.tombstonePathPointer = strdup(tombstoneURL.path)
-        
+
         // Cache main binary load address, slide, name, and UUID for signal-safe tombstone writing
         Self.cacheMainImageMetadata()
-        
+
         // Signal handlers for fatal signals.
         // Ignore SIGPIPE so broken network pipes surface as EPIPE error returns rather than crashing the process.
         Self.ignoreSigpipe()
         let signals: [Int32] = [SIGTRAP, SIGABRT, SIGILL, SIGSEGV, SIGFPE, SIGBUS, SIGXCPU, SIGXFSZ, SIGSYS]
-        
+
         var sa = sigaction()
         sa.__sigaction_u.__sa_handler = { sig in
             Wappn.handleSignal(sig)
         }
         sa.sa_flags = SA_NODEFER | SA_RESETHAND
         sigemptyset(&sa.sa_mask)
-        
+
         for sig in signals {
             sigaction(sig, &sa, nil)
         }
     }
-    
+
     /// Low-level signal handler.
     ///
     /// ### Async-Signal Safety Trade-off:
@@ -451,13 +447,13 @@ public final class Wappn: @unchecked Sendable {
             Self.ignoreSigpipe()
             return
         }
-        
+
         if let path = tombstonePathPointer {
             // Restrict tombstone creation permissions to 0o600 (owner read/write only)
             let fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0o600)
             if fd >= 0 {
                 safeWrite(fd, "SIGNAL:")
-                
+
                 // Write signal name safely using static string literals
                 switch sig {
                 case SIGTRAP: safeWrite(fd, "SIGTRAP")
@@ -472,13 +468,13 @@ public final class Wappn: @unchecked Sendable {
                 case SIGSYS: safeWrite(fd, "SIGSYS")
                 default: safeWrite(fd, "UNKNOWN")
                 }
-                
+
                 safeWrite(fd, "\nTIME:")
                 var tv = timeval()
                 gettimeofday(&tv, nil)
                 safeWriteDecimalUInt(fd, UInt(max(0, tv.tv_sec)))
                 safeWrite(fd, "\n")
-                
+
                 if let imgName = mainImageNamePointer {
                     safeWrite(fd, "IMAGE:")
                     safeWriteCString(fd, imgName)
@@ -499,7 +495,7 @@ public final class Wappn: @unchecked Sendable {
                     safeWrite(fd, "SLIDE:")
                     safeWriteHexUInt(fd, mainImageSlide)
                 }
-                
+
                 // Write call stack backtrace to tombstone file descriptor using async-signal-safe formatting
                 safeWrite(fd, "STACK:\n")
                 withUnsafeTemporaryAllocation(of: UnsafeMutableRawPointer?.self, capacity: 128) { buffer in
@@ -513,13 +509,13 @@ public final class Wappn: @unchecked Sendable {
                         }
                     }
                 }
-                
+
                 // Flush and close
                 fsync(fd)
                 close(fd)
             }
         }
-        
+
         // CRITICAL: Re-raise the signal to terminate the app.
         // We reset to default first to avoid infinite recursion.
         Darwin.signal(sig, SIG_DFL)
@@ -533,7 +529,7 @@ public final class Wappn: @unchecked Sendable {
         guard let header = _dyld_get_image_header(0) else { return }
         mainImageBaseAddress = UInt(bitPattern: header)
         mainImageSlide = UInt(bitPattern: Int(_dyld_get_image_vmaddr_slide(0)))
-        
+
         if let existingName = mainImageNamePointer {
             free(existingName)
             mainImageNamePointer = nil
@@ -543,7 +539,7 @@ public final class Wappn: @unchecked Sendable {
             let binaryName = (fullName as NSString).lastPathComponent
             mainImageNamePointer = strdup(binaryName)
         }
-        
+
         if let existingUUID = mainImageUUIDPointer {
             free(existingUUID)
             mainImageUUIDPointer = nil
@@ -555,15 +551,15 @@ public final class Wappn: @unchecked Sendable {
         }
         #endif
     }
-    
+
     #if canImport(Darwin)
-    private static func extractImageDetails(from header: UnsafePointer<mach_header>) -> (uuid: String?, textVMSize: UInt) {
+    internal static func extractImageDetails(from header: UnsafePointer<mach_header>) -> (uuid: String?, textVMSize: UInt) {
         guard header.pointee.magic == MH_MAGIC_64 else { return (nil, 0) }
         let header64 = UnsafeRawPointer(header).assumingMemoryBound(to: mach_header_64.self)
         var cmdPtr = UnsafeRawPointer(header).advanced(by: MemoryLayout<mach_header_64>.size)
         var foundUUID: String?
-        var textVMSize: UInt = 0
-        
+        var textStartVMAddr: UInt?
+        var maxTextEndVMAddr: UInt = 0
         for _ in 0..<header64.pointee.ncmds {
             let cmd = cmdPtr.assumingMemoryBound(to: load_command.self).pointee
             guard cmd.cmdsize >= MemoryLayout<load_command>.size else { break }
@@ -572,15 +568,27 @@ public final class Wappn: @unchecked Sendable {
                 foundUUID = UUID(uuid: uuidCmd.uuid).uuidString
             } else if cmd.cmd == LC_SEGMENT_64 {
                 let segCmd = cmdPtr.assumingMemoryBound(to: segment_command_64.self).pointee
-                let isText = withUnsafeBytes(of: segCmd.segname) { raw -> Bool in
-                    guard let ptr = raw.baseAddress?.assumingMemoryBound(to: CChar.self) else { return false }
-                    return strcmp(ptr, "__TEXT") == 0
+                let (isBaseText, isTextExec) = withUnsafeBytes(of: segCmd.segname) { raw -> (Bool, Bool) in
+                    guard let ptr = raw.baseAddress?.assumingMemoryBound(to: CChar.self) else { return (false, false) }
+                    return (strncmp(ptr, "__TEXT", 16) == 0, strncmp(ptr, "__TEXT_EXEC", 16) == 0)
                 }
-                if isText {
-                    textVMSize = UInt(segCmd.vmsize)
+                if isBaseText || isTextExec {
+                    let vmAddr = UInt(segCmd.vmaddr)
+                    let vmEnd = vmAddr &+ UInt(segCmd.vmsize)
+                    if isBaseText || textStartVMAddr == nil {
+                        textStartVMAddr = vmAddr
+                    }
+                    maxTextEndVMAddr = max(maxTextEndVMAddr, vmEnd)
                 }
             }
             cmdPtr = cmdPtr.advanced(by: Int(cmd.cmdsize))
+        }
+
+        let textVMSize: UInt
+        if let start = textStartVMAddr, maxTextEndVMAddr > start {
+            textVMSize = maxTextEndVMAddr - start
+        } else {
+            textVMSize = 0
         }
         return (foundUUID, textVMSize)
     }
@@ -599,7 +607,8 @@ public final class Wappn: @unchecked Sendable {
     @inline(__always)
     private static func safeWriteCString(_ fd: Int32, _ pointer: UnsafePointer<CChar>) {
         var length = 0
-        while pointer[length] != 0 {
+        let maxLen = 1024
+        while length < maxLen && pointer[length] != 0 {
             length += 1
         }
         if length > 0 {
@@ -682,7 +691,7 @@ public final class Wappn: @unchecked Sendable {
                 }
                 rawBuf[pos] = UInt8(ascii: "x")
                 rawBuf[pos - 1] = UInt8(ascii: "0")
-                
+
                 let start = pos - 1
                 let length = 24 - start
                 if let base = rawBuf.baseAddress {
@@ -691,11 +700,11 @@ public final class Wappn: @unchecked Sendable {
             }
         }
     }
-    
+
     private func handleCrash(_ crash: CrashInfo) {
         // CRITICAL: Save crash info FIRST - this is the most important operation
         saveCrashInfo(crash)
-        
+
         // Store crash info synchronously (no async!)
         lock.lock()
         crashInfo = crash
@@ -703,10 +712,10 @@ public final class Wappn: @unchecked Sendable {
         capturedOutput.append("\n" + crash.description + "\n")
         let callback = onCrash
         lock.unlock()
-        
+
         // Call user callback synchronously - this is the last chance!
         callback?(crash)
-        
+
         // Also write to original stdout
         if originalStdout >= 0 {
             let crashDesc = crash.description
@@ -715,31 +724,31 @@ public final class Wappn: @unchecked Sendable {
             }
         }
         print("⚠️ Wappn detected a crash: \(crash.reason)")
-        
+
         // Force flush to disk AFTER writing everything
         fflush(stdout)
         fflush(stderr)
         sync() // Force all pending disk writes
     }
-    
+
     internal func saveCrashInfo(_ crash: CrashInfo) {
         // CRITICAL: Use most reliable write method in crash scenario
         let encoder = JSONEncoder()
         encoder.outputFormatting = .prettyPrinted
-        
+
         guard let data = try? encoder.encode(crash) else {
             print("❌ Failed to encode crash info")
             return
         }
-        
+
         writeCrashData(data)
     }
-    
+
     private func writeCrashData(_ data: Data) {
         // Method 1: Try atomic write with fsync
         do {
             try data.write(to: crashFileURL, options: [.atomic])
-            
+
             // CRITICAL: Open file in READ-WRITE mode for fsync (not O_RDONLY!)
             let fileDescriptor = open(crashFileURL.path, O_RDWR)
             if fileDescriptor >= 0 {
@@ -751,14 +760,14 @@ public final class Wappn: @unchecked Sendable {
         } catch {
             print("⚠️ Atomic write failed, trying low-level write: \(error)")
         }
-        
+
         // Method 2: Fallback to direct file descriptor write (more reliable in crash scenarios)
         let fileDescriptor = open(crashFileURL.path, O_WRONLY | O_CREAT | O_TRUNC, 0o644)
         guard fileDescriptor >= 0 else {
             print("❌ Failed to open file descriptor")
             return
         }
-        
+
         data.withUnsafeBytes { bytes in
             guard let baseAddress = bytes.baseAddress, bytes.count > 0 else {
                 return
@@ -769,7 +778,7 @@ public final class Wappn: @unchecked Sendable {
         close(fileDescriptor)
         print("✅ Crash info saved via low-level write: \(crashFileURL.path)")
     }
-    
+
     /// Returns a descriptive name for a standard POSIX fatal signal.
     ///
     /// - Parameter signal: The POSIX signal integer (e.g., `SIGSEGV`, `SIGTRAP`).
@@ -980,4 +989,3 @@ public func logv(_ items: Any...,
     logItems(.verbose, items, separator: separator, terminator: terminator, file: file, line: line, function: function)
     #endif
 }
-
