@@ -558,7 +558,8 @@ public final class Wappn: @unchecked Sendable {
         let header64 = UnsafeRawPointer(header).assumingMemoryBound(to: mach_header_64.self)
         var cmdPtr = UnsafeRawPointer(header).advanced(by: MemoryLayout<mach_header_64>.size)
         var foundUUID: String?
-        var textVMSize: UInt = 0
+        var textStartVMAddr: UInt?
+        var maxTextEndVMAddr: UInt = 0
         for _ in 0..<header64.pointee.ncmds {
             let cmd = cmdPtr.assumingMemoryBound(to: load_command.self).pointee
             guard cmd.cmdsize >= MemoryLayout<load_command>.size else { break }
