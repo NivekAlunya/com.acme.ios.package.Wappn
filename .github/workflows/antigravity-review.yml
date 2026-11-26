@@ -28,12 +28,20 @@ jobs:
 
       - name: Generate PR Diff & Review
         env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY || secrets.ANTIGRAVITY_API_KEY }}
-          GEMINI_MODEL: ${{ vars.GEMINI_MODEL || 'gemini-3.7-flash' }}
+          GEMINI_MODEL: ${{ vars.GEMINI_MODEL || 'gemini-3.5-flash-lite' }}
           PR_BASE: "origin/${{ github.base_ref }}"
           PR_TITLE: ${{ github.event.pull_request.title }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
+          # Trim accidental whitespace or control chars from pasted secrets/variables
+          GEMINI_API_KEY=$(printf '%s' "$GEMINI_API_KEY" | tr -d '[:space:][:cntrl:]')
+          GEMINI_MODEL=$(printf '%s' "$GEMINI_MODEL" | tr -d '[:space:][:cntrl:]')
+          if [ -z "$GEMINI_MODEL" ]; then
+            GEMINI_MODEL="gemini-3.5-flash-lite"
+          fi
+
           # Precondition 1: Verify API Key presence
           if [ -z "$GEMINI_API_KEY" ]; then
             echo "::warning ::Neither GEMINI_API_KEY nor ANTIGRAVITY_API_KEY secret is configured in this repository."
@@ -51,23 +59,51 @@ jobs:
             exit 0
           fi
 
-          # Precondition 3: Guard against massive diffs (truncate to 1500 lines)
+          # Precondition 3: Guard against massive diffs (truncate to 800 lines for fast review)
           DIFF_LINES=$(wc -l < pr_diff.patch)
-          if [ "$DIFF_LINES" -gt 1500 ]; then
-            head -n 1500 pr_diff.patch > prompt_diff.patch
-            echo -e "\n\n... [Diff truncated: exceeded 1500 lines] ..." >> prompt_diff.patch
+          if [ "$DIFF_LINES" -gt 800 ]; then
+            head -n 800 pr_diff.patch > prompt_diff.patch
+            echo -e "\n\n... [Diff truncated: exceeded 800 lines] ..." >> prompt_diff.patch
           else
             cp pr_diff.patch prompt_diff.patch
+          fi
+
+          # Precondition 4: Fetch previous review history on this PR to prevent circular feedback
+          PREV_REVIEWS=$(gh api "repos/${{ github.repository }}/issues/${PR_NUMBER}/comments" \
+            --jq '[.[] | select(.body | contains("<!-- antigravity-pr-reviewer -->")) | .body] | .[-2:] | join("\n\n---\n\n")' 2>/dev/null || echo "")
+
+          if [ -n "$PREV_REVIEWS" ]; then
+            cat << 'EOF' > history_prompt.txt
+
+          ### 📜 Previous Review History (Your Earlier Feedback on This PR):
+          The author is addressing earlier review rounds. Below is the feedback you previously provided:
+          """
+          EOF
+            echo "$PREV_REVIEWS" >> history_prompt.txt
+            cat << 'EOF' >> history_prompt.txt
+          """
+
+          ⚠️ STRICT REVIEW CONTINUITY RULES:
+          1. Do NOT contradict or reverse your own previous recommendations or proposed code patterns.
+          2. If the author implemented a suggestion you requested in an earlier review, do NOT raise a new error or critique against your own proposed solution. Avoid circular feedback.
+          3. Acknowledge resolved points as fixed. Only raise genuinely new, critical issues or regressions introduced in the latest changes.
+          EOF
+          else
+            touch history_prompt.txt
           fi
 
           # Assemble review prompt
           cat << 'EOF' > system_prompt.txt
           You are a Senior DevOps & Principal Software Engineer reviewing a GitHub PR.
+          Focus strictly and exclusively on the updated parts of the code (the lines added, modified, or directly affected in this pull request diff). Do NOT review, flag issues in, or comment on untouched pre-existing code or surrounding context lines.
+          
+          Maintain strict review continuity: do NOT contradict your previous feedback or raise issues against code written specifically to address your prior suggestions.
+
           Provide a concise, high-signal code review covering:
-          1. 🛡️ Security: Hardcoded secrets, credential leaks, injection risks.
-          2. ⚠️ Logic & Reliability: Error handling, edge cases, breaking changes.
-          3. ⚡ Performance & Scalability: Inefficient loops, resource leaks.
-          4. 🧪 Testing & CI/CD: Missing tests or pipeline impacts.
+          1. 🛡️ Security: Hardcoded secrets, credential leaks, injection risks in the changed code.
+          2. ⚠️ Logic & Reliability: Error handling, edge cases, breaking changes introduced by the diff.
+          3. ⚡ Performance & Scalability: Inefficient loops, resource leaks in the modifications.
+          4. 🧪 Testing & CI/CD: Missing tests or pipeline impacts related to the updates.
 
           Format clearly in markdown with code suggestions where applicable.
           EOF
@@ -77,53 +113,103 @@ jobs:
 
           Pull Request: "${PR_TITLE}" (#${PR_NUMBER})
 
+          IMPORTANT: Focus your review strictly and exclusively on the updated parts of the code below. Do not comment on untouched or pre-existing code.
+          $(cat history_prompt.txt)
+
           Git Diff:
           \`\`\`diff
           $(cat prompt_diff.patch)
           \`\`\`
           EOF
 
-          # Create JSON payload cleanly with jq
-          jq -n --rawfile text full_prompt.txt '
-            {
-              contents: [{ parts: [{ text: $text }] }],
-              generationConfig: { temperature: 0.2 }
-            }
-          ' > request.json
+          # Candidate models: Primary model followed by resilient fallbacks
+          CANDIDATE_MODELS=("${GEMINI_MODEL}")
+          for fb in "gemini-4-hydrogen" "gemini-3.5-flash-lite" "gemini-3.1-flash-lite" "gemini-2.5-flash"; do
+            if [ "$fb" != "${GEMINI_MODEL}" ]; then
+              CANDIDATE_MODELS+=("$fb")
+            fi
+          done
 
-          # Call Gemini API with progressive delay (attempt * 15s) for 429 and 503
-          MAX_RETRIES=5
+          MAX_RETRIES=6
           SUCCESS=false
+          MODEL_IDX=0
+          CURRENT_MODEL="${CANDIDATE_MODELS[0]}"
 
           # Initial jitter (0-5s) to avoid burst collision when multiple packages trigger concurrently
           sleep $((RANDOM % 6))
 
           for attempt in $(seq 1 $MAX_RETRIES); do
-            echo "Calling Gemini API with model '${GEMINI_MODEL}' (attempt $attempt of $MAX_RETRIES)..."
-            HTTP_STATUS=$(curl -s -o response.json -w "%{http_code}" \
-              -H "Content-Type: application/json" \
-              "https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}" \
-              -d @request.json)
+            # Fall back to alternative model if primary model experiences persistent 503 or 429
+            if [ "$attempt" -gt 2 ] && [ $((MODEL_IDX + 1)) -lt ${#CANDIDATE_MODELS[@]} ] && [ $((attempt % 2)) -eq 1 ]; then
+              MODEL_IDX=$((MODEL_IDX + 1))
+              CURRENT_MODEL="${CANDIDATE_MODELS[$MODEL_IDX]}"
+              echo "🔄 Switching to fallback model '${CURRENT_MODEL}' due to repeated server overload / rate limits..."
+            fi
 
-            if [ "$HTTP_STATUS" -eq 200 ]; then
+            # Dynamically configure thinking level only for models that support/require it (e.g. gemini-3.8 / gemini-3.6)
+            if [[ "${CURRENT_MODEL}" =~ 3\.[68] ]]; then
+              THINKING_ARG='{"thinkingLevel": "low"}'
+            else
+              THINKING_ARG='null'
+            fi
+
+            jq -n \
+              --rawfile text full_prompt.txt \
+              --argjson thinking "$THINKING_ARG" '
+              {
+                contents: [{ parts: [{ text: $text }] }],
+                generationConfig: (
+                  {
+                    temperature: 0.2,
+                    maxOutputTokens: 4096
+                  } + (if $thinking != null then { thinkingConfig: $thinking } else {} end)
+                )
+              }
+            ' > request.json
+
+            echo "Calling Gemini API with model '${CURRENT_MODEL}' (attempt $attempt of $MAX_RETRIES)..."
+            rm -f response.json
+            CURL_EXIT=0
+            HTTP_STATUS=$(curl -sS --connect-timeout 20 --max-time 180 -o response.json -w "%{http_code}" \
+              -H "Content-Type: application/json" \
+              -H "x-goog-api-key: ${GEMINI_API_KEY}" \
+              "https://generativelanguage.googleapis.com/v1beta/models/${CURRENT_MODEL}:generateContent" \
+              -d @request.json) || CURL_EXIT=$?
+
+            if ! [[ "$HTTP_STATUS" =~ ^[0-9]{3}$ ]]; then
+              HTTP_STATUS="000"
+            fi
+
+            if [ "$CURL_EXIT" -eq 3 ]; then
+              echo "❌ Invalid Gemini API URL for model '${CURRENT_MODEL}' (curl exit code 3). Verify the model name."
+              exit 1
+            elif [ "$CURL_EXIT" -ne 0 ]; then
+              echo "⚠️ curl exited with code $CURL_EXIT (HTTP status: $HTTP_STATUS)."
+            fi
+
+            if [ "$CURL_EXIT" -eq 0 ] && [ "$HTTP_STATUS" -eq 200 ]; then
               SUCCESS=true
               break
-            elif [ "$HTTP_STATUS" -eq 429 ] || [ "$HTTP_STATUS" -eq 503 ]; then
+            elif [ "$CURL_EXIT" -ne 0 ] || [ "$HTTP_STATUS" -eq 429 ] || [ "$HTTP_STATUS" -eq 500 ] || [ "$HTTP_STATUS" -eq 502 ] || [ "$HTTP_STATUS" -eq 503 ] || [ "$HTTP_STATUS" -eq 504 ] || [ "$HTTP_STATUS" -eq 000 ]; then
               if [ "$attempt" -lt "$MAX_RETRIES" ]; then
                 RETRY_DELAY=$((attempt * 15))
-                echo "⚠️ HTTP $HTTP_STATUS received (High Demand / Rate Limited). Retrying in ${RETRY_DELAY}s (attempt $attempt of $MAX_RETRIES)..."
+                echo "⚠️ Transient error (HTTP status '$HTTP_STATUS', curl exit '$CURL_EXIT'). Retrying in ${RETRY_DELAY}s (attempt $attempt of $MAX_RETRIES)..."
                 sleep $RETRY_DELAY
               fi
             else
               echo "❌ API request failed with unrecoverable HTTP $HTTP_STATUS:"
-              cat response.json
+              if [ -s response.json ]; then
+                cat response.json
+              fi
               exit 1
             fi
           done
 
           if [ "$SUCCESS" != "true" ]; then
             echo "❌ Gemini API request failed after $MAX_RETRIES attempts (last HTTP status: $HTTP_STATUS):"
-            cat response.json
+            if [ -s response.json ]; then
+              cat response.json
+            fi
             exit 1
           fi
 
@@ -134,9 +220,9 @@ jobs:
           jq -r '.candidates[0].content.parts[0].text // "Review completed with no findings."' response.json >> review.md
           echo "" >> review.md
           echo "---" >> review.md
-          echo "*Reviewed by Antigravity Agent using \`${GEMINI_MODEL}\` on commit \`${GITHUB_SHA:0:7}\`*" >> review.md
+          echo "*Reviewed by Antigravity Agent using \`${CURRENT_MODEL}\` on commit \`${GITHUB_SHA:0:7}\`*" >> review.md
 
-      - name: Post or Update PR Comment
+      - name: Post PR Review Comment
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
@@ -147,14 +233,5 @@ jobs:
             exit 0
           fi
 
-          COMMENT_ID=$(gh api repos/${{ github.repository }}/issues/$PR_NUMBER/comments \
-            --jq '.[] | select(.body | contains("<!-- antigravity-pr-reviewer -->")) | .id' | head -n 1)
-
-          if [ -n "$COMMENT_ID" ]; then
-            echo "Updating existing comment ID: $COMMENT_ID..."
-            gh api --method PATCH repos/${{ github.repository }}/issues/comments/$COMMENT_ID \
-              -F body=@review.md
-          else
-            echo "Posting new PR review comment..."
-            gh pr comment $PR_NUMBER --body-file review.md
-          fi
+          echo "Posting new PR review comment..."
+          gh pr comment "$PR_NUMBER" --body-file review.md

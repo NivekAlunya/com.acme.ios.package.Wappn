@@ -262,7 +262,10 @@ public final class Wappn: @unchecked Sendable {
                 } else if let value = Self.headerValue(in: line, prefix: "SLIDE:") {
                     slideAddress = Self.parseHexUInt(value) ?? 0
                 } else if let value = Self.headerValue(in: line, prefix: "IMAGE:"), !value.isEmpty {
-                    imageName = value
+                    let sanitized = String(value.unicodeScalars.filter { !CharacterSet.controlCharacters.contains($0) })
+                    if !sanitized.isEmpty {
+                        imageName = sanitized
+                    }
                 } else if let value = Self.headerValue(in: line, prefix: "UUID:"), !value.isEmpty {
                     imageUUID = value
                 } else if isReadingStack, !line.isEmpty {
@@ -550,7 +553,7 @@ public final class Wappn: @unchecked Sendable {
     }
 
     #if canImport(Darwin)
-    private static func extractImageDetails(from header: UnsafePointer<mach_header>) -> (uuid: String?, textVMSize: UInt) {
+    internal static func extractImageDetails(from header: UnsafePointer<mach_header>) -> (uuid: String?, textVMSize: UInt) {
         guard header.pointee.magic == MH_MAGIC_64 else { return (nil, 0) }
         let header64 = UnsafeRawPointer(header).assumingMemoryBound(to: mach_header_64.self)
         var cmdPtr = UnsafeRawPointer(header).advanced(by: MemoryLayout<mach_header_64>.size)
@@ -564,15 +567,27 @@ public final class Wappn: @unchecked Sendable {
                 foundUUID = UUID(uuid: uuidCmd.uuid).uuidString
             } else if cmd.cmd == LC_SEGMENT_64 {
                 let segCmd = cmdPtr.assumingMemoryBound(to: segment_command_64.self).pointee
-                let isText = withUnsafeBytes(of: segCmd.segname) { raw -> Bool in
-                    guard let ptr = raw.baseAddress?.assumingMemoryBound(to: CChar.self) else { return false }
-                    return strcmp(ptr, "__TEXT") == 0
+                let (isBaseText, isTextExec) = withUnsafeBytes(of: segCmd.segname) { raw -> (Bool, Bool) in
+                    guard let ptr = raw.baseAddress?.assumingMemoryBound(to: CChar.self) else { return (false, false) }
+                    return (strncmp(ptr, "__TEXT", 16) == 0, strncmp(ptr, "__TEXT_EXEC", 16) == 0)
                 }
-                if isText {
-                    textVMSize = UInt(segCmd.vmsize)
+                if isBaseText || isTextExec {
+                    let vmAddr = UInt(segCmd.vmaddr)
+                    let vmEnd = vmAddr &+ UInt(segCmd.vmsize)
+                    if isBaseText || textStartVMAddr == nil {
+                        textStartVMAddr = vmAddr
+                    }
+                    maxTextEndVMAddr = max(maxTextEndVMAddr, vmEnd)
                 }
             }
             cmdPtr = cmdPtr.advanced(by: Int(cmd.cmdsize))
+        }
+
+        let textVMSize: UInt
+        if let start = textStartVMAddr, maxTextEndVMAddr > start {
+            textVMSize = maxTextEndVMAddr - start
+        } else {
+            textVMSize = 0
         }
         return (foundUUID, textVMSize)
     }
@@ -591,7 +606,8 @@ public final class Wappn: @unchecked Sendable {
     @inline(__always)
     private static func safeWriteCString(_ fd: Int32, _ pointer: UnsafePointer<CChar>) {
         var length = 0
-        while pointer[length] != 0 {
+        let maxLen = 1024
+        while length < maxLen && pointer[length] != 0 {
             length += 1
         }
         if length > 0 {

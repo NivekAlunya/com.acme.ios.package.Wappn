@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(Darwin)
+import MachO
+#endif
 import Testing
 @testable import Wappn
 
@@ -151,6 +154,81 @@ struct WappnTests {
         #expect(Wappn.parseHexUInt("0xZZZZ") == nil)
         #expect(Wappn.parseHexUInt("0xFFFFFFFFFFFFFFFFF") == nil)
     }
+
+    @Test("Tombstone recovery strips control characters from IMAGE name")
+    func tombstoneSanitizesImageNameControlChars() throws {
+        let wappn = Wappn.shared
+        wappn.clearCrashMarker()
+
+        let tombstoneContent = "SIGNAL:SIGTRAP\nTIME:1710000000\nIMAGE:My\u{0007}App\u{001B}\nBASE:0x104000000\nEND:0x104100000\nSTACK:\n0x10405e664\n"
+        try tombstoneContent.write(to: wappn.tombstoneURL, atomically: true, encoding: .utf8)
+
+        wappn.recoverFromTombstone()
+        defer { wappn.clearCrashMarker() }
+
+        let recovered = try #require(wappn.getLastCrashInfo())
+        #expect(recovered.callStack.contains("Binary: MyApp"))
+        #expect(recovered.callStack.contains("0x10405e664 (MyApp + 0x5e664)"))
+        #expect(recovered.callStack.contains("Symbolicate: atos -arch arm64 -o 'MyApp.app/MyApp' -l 0x104000000 0x10405e664"))
+    }
+
+    #if canImport(Darwin)
+    @Test("extractImageDetails supports __TEXT_EXEC, LC_UUID, and non-null-terminated 16-byte segnames")
+    func extractImageDetailsWithTextExecAnd16ByteSegname() {
+        let headerSize = MemoryLayout<mach_header_64>.size
+        let uuidCmdSize = MemoryLayout<uuid_command>.size
+        let segCmdSize = MemoryLayout<segment_command_64>.size
+        let totalSize = headerSize + uuidCmdSize + segCmdSize * 4
+
+        let rawBuffer = UnsafeMutableRawPointer.allocate(byteCount: totalSize, alignment: MemoryLayout<mach_header_64>.alignment)
+        defer { rawBuffer.deallocate() }
+        rawBuffer.initializeMemory(as: UInt8.self, repeating: 0, count: totalSize)
+
+        var header = mach_header_64()
+        header.magic = MH_MAGIC_64
+        header.ncmds = 5
+        header.sizeofcmds = UInt32(uuidCmdSize + segCmdSize * 4)
+        rawBuffer.storeBytes(of: header, as: mach_header_64.self)
+
+        var offset = headerSize
+
+        var uuidCmd = uuid_command()
+        uuidCmd.cmd = UInt32(LC_UUID)
+        uuidCmd.cmdsize = UInt32(uuidCmdSize)
+        uuidCmd.uuid = (0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
+                        0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00)
+        rawBuffer.advanced(by: offset).storeBytes(of: uuidCmd, as: uuid_command.self)
+        offset += uuidCmdSize
+
+        func writeSegment(name: String, vmaddr: UInt64, vmsize: UInt64) {
+            var seg = segment_command_64()
+            seg.cmd = UInt32(LC_SEGMENT_64)
+            seg.cmdsize = UInt32(segCmdSize)
+            seg.vmaddr = vmaddr
+            seg.vmsize = vmsize
+            let bytes = Array(name.utf8.prefix(16))
+            withUnsafeMutableBytes(of: &seg.segname) { dest in
+                for (index, byte) in bytes.enumerated() {
+                    dest[index] = byte
+                }
+            }
+            rawBuffer.advanced(by: offset).storeBytes(of: seg, as: segment_command_64.self)
+            offset += segCmdSize
+        }
+
+        writeSegment(name: "__TEXT", vmaddr: 0x100000000, vmsize: 0x4000)
+        writeSegment(name: "__TEXT_EXEC", vmaddr: 0x100004000, vmsize: 0x2000)
+        // Full 16-byte non-null-terminated name must not match __TEXT or read past 16 bytes
+        writeSegment(name: "__TEXT_UNTERMINA", vmaddr: 0x100006000, vmsize: 0x8000)
+        writeSegment(name: "__DATA", vmaddr: 0x10000E000, vmsize: 0x4000)
+
+        let machHeaderPtr = rawBuffer.assumingMemoryBound(to: mach_header.self)
+        let details = Wappn.extractImageDetails(from: machHeaderPtr)
+
+        #expect(details.uuid == "11223344-5566-7788-99AA-BBCCDDEEFF00")
+        #expect(details.textVMSize == 0x6000)
+    }
+    #endif
     
     @Test("Log capture and buffer management")
     func outputCaptureAndClearing() {
