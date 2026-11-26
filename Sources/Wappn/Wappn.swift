@@ -1,6 +1,7 @@
 import Foundation
 #if canImport(Darwin)
 import Darwin
+import MachO
 #elseif canImport(Glibc)
 import Glibc
 #endif
@@ -232,39 +233,85 @@ public final class Wappn: @unchecked Sendable {
         
         do {
             let content = try String(contentsOf: tombstoneURL, encoding: .utf8)
-            let lines = content.components(separatedBy: "\n")
             
             var signalName = "Unknown"
             var timestamp = Date()
-            var callStack: [String] = []
+            var imageName: String?
+            var imageUUID: String?
+            var baseAddress: UInt = 0
+            var endAddress: UInt = 0
+            var slideAddress: UInt = 0
+            var rawFrames: [String] = []
             var isReadingStack = false
             
-            for line in lines {
-                if line.hasPrefix("STACK:") {
+            for rawLine in content.split(separator: "\n", omittingEmptySubsequences: false) {
+                let line = rawLine.trimmingCharacters(in: .whitespaces)
+                if line == "STACK:" || line.hasPrefix("STACK:") {
                     isReadingStack = true
                     continue
                 }
                 
-                if line.hasPrefix("SIGNAL:") || line.hasPrefix("TIME:") || line.hasPrefix("APP:") || line.hasPrefix("BUILD:") {
+                if line.hasPrefix("SIGNAL:") || line.hasPrefix("TIME:") || line.hasPrefix("APP:") || line.hasPrefix("BUILD:") || line.hasPrefix("BASE:") || line.hasPrefix("END:") || line.hasPrefix("SLIDE:") || line.hasPrefix("IMAGE:") || line.hasPrefix("UUID:") {
                     isReadingStack = false
                 }
                 
-                if line.hasPrefix("SIGNAL:"), let val = line.split(separator: ":").last {
-                    signalName = String(val).trimmingCharacters(in: .whitespaces)
-                } else if line.hasPrefix("TIME:"), let val = line.split(separator: ":").last, let ts = Double(val.trimmingCharacters(in: .whitespaces)) {
-                    if ts > 0 {
-                        timestamp = Date(timeIntervalSince1970: ts)
-                    }
-                } else if isReadingStack {
-                    let trimmed = line.trimmingCharacters(in: .whitespaces)
-                    if !trimmed.isEmpty {
-                        callStack.append(trimmed)
-                    }
+                if let value = Self.headerValue(in: line, prefix: "SIGNAL:") {
+                    signalName = value
+                } else if let value = Self.headerValue(in: line, prefix: "TIME:"), let ts = Double(value), ts > 0 {
+                    timestamp = Date(timeIntervalSince1970: ts)
+                } else if let value = Self.headerValue(in: line, prefix: "BASE:") {
+                    baseAddress = Self.parseHexUInt(value) ?? 0
+                } else if let value = Self.headerValue(in: line, prefix: "END:") {
+                    endAddress = Self.parseHexUInt(value) ?? 0
+                } else if let value = Self.headerValue(in: line, prefix: "SLIDE:") {
+                    slideAddress = Self.parseHexUInt(value) ?? 0
+                } else if let value = Self.headerValue(in: line, prefix: "IMAGE:"), !value.isEmpty {
+                    imageName = value
+                } else if let value = Self.headerValue(in: line, prefix: "UUID:"), !value.isEmpty {
+                    imageUUID = value
+                } else if isReadingStack, !line.isEmpty {
+                    rawFrames.append(line)
                 }
             }
             
-            if callStack.isEmpty {
-                callStack = ["Address recovery not implemented for tombstone"]
+            var callStack: [String] = []
+            if let imageName {
+                let uuidPart = imageUUID.map { " (UUID: \($0))" } ?? ""
+                callStack.append("Binary: \(imageName)\(uuidPart)")
+            }
+            if baseAddress > 0 {
+                let baseHex = "0x" + String(baseAddress, radix: 16)
+                let slideHex = "0x" + String(slideAddress, radix: 16)
+                callStack.append("Load Address: \(baseHex) (Slide: \(slideHex))")
+            }
+            
+            let hasValidBounds = baseAddress > 0 && endAddress > baseAddress
+            var appFrames: [String] = []
+            let formattedFrames = rawFrames.map { frame -> String in
+                guard hasValidBounds,
+                      let addr = Self.parseHexUInt(frame),
+                      addr >= baseAddress,
+                      addr < endAddress else {
+                    return frame
+                }
+                appFrames.append(frame)
+                let offset = addr - baseAddress
+                let label = imageName ?? "Image"
+                return "\(frame) (\(label) + 0x\(String(offset, radix: 16)))"
+            }
+            
+            if formattedFrames.isEmpty {
+                callStack.append("Address recovery not implemented for tombstone")
+            } else {
+                callStack.append(contentsOf: formattedFrames)
+                if baseAddress > 0 {
+                    let baseHex = "0x" + String(baseAddress, radix: 16)
+                    let binaryName = imageName ?? "Binary"
+                    let appPath = "\(binaryName).app/\(binaryName)"
+                    let escapedPath = appPath.replacingOccurrences(of: "'", with: "'\\''")
+                    let addrs = (appFrames.isEmpty ? rawFrames : appFrames).joined(separator: " ")
+                    callStack.append("Symbolicate: atos -arch arm64 -o '\(escapedPath)' -l \(baseHex) \(addrs)")
+                }
             }
             
             let crash = CrashInfo(
@@ -288,8 +335,26 @@ public final class Wappn: @unchecked Sendable {
         }
     }
     
+    internal static func parseHexUInt(_ string: String) -> UInt? {
+        let stripped = string.hasPrefix("0x") || string.hasPrefix("0X")
+            ? String(string.dropFirst(2))
+            : string
+        guard !stripped.isEmpty else { return nil }
+        return UInt(stripped, radix: 16)
+    }
+
+    private static func headerValue(in line: String, prefix: String) -> String? {
+        guard line.hasPrefix(prefix) else { return nil }
+        return line.dropFirst(prefix.count).trimmingCharacters(in: .whitespaces)
+    }
+    
     // MARK: - Signal Safe Storage
     nonisolated(unsafe) private static var tombstonePathPointer: UnsafeMutablePointer<CChar>?
+    nonisolated(unsafe) private static var mainImageBaseAddress: UInt = 0
+    nonisolated(unsafe) private static var mainImageEndAddress: UInt = 0
+    nonisolated(unsafe) private static var mainImageSlide: UInt = 0
+    nonisolated(unsafe) private static var mainImageNamePointer: UnsafeMutablePointer<CChar>?
+    nonisolated(unsafe) private static var mainImageUUIDPointer: UnsafeMutablePointer<CChar>?
     
     // MARK: - Private Methods
     
@@ -345,6 +410,9 @@ public final class Wappn: @unchecked Sendable {
             Wappn.tombstonePathPointer = nil
         }
         Wappn.tombstonePathPointer = strdup(tombstoneURL.path)
+        
+        // Cache main binary load address, slide, name, and UUID for signal-safe tombstone writing
+        Self.cacheMainImageMetadata()
         
         // Signal handlers for fatal signals.
         // Ignore SIGPIPE so broken network pipes surface as EPIPE error returns rather than crashing the process.
@@ -405,7 +473,32 @@ public final class Wappn: @unchecked Sendable {
                 default: safeWrite(fd, "UNKNOWN")
                 }
                 
-                safeWrite(fd, "\nTIME:0\n")
+                safeWrite(fd, "\nTIME:")
+                var tv = timeval()
+                gettimeofday(&tv, nil)
+                safeWriteDecimalUInt(fd, UInt(max(0, tv.tv_sec)))
+                safeWrite(fd, "\n")
+                
+                if let imgName = mainImageNamePointer {
+                    safeWrite(fd, "IMAGE:")
+                    safeWriteCString(fd, imgName)
+                    safeWrite(fd, "\n")
+                }
+                if let imgUUID = mainImageUUIDPointer {
+                    safeWrite(fd, "UUID:")
+                    safeWriteCString(fd, imgUUID)
+                    safeWrite(fd, "\n")
+                }
+                if mainImageBaseAddress > 0 {
+                    safeWrite(fd, "BASE:")
+                    safeWriteHexUInt(fd, mainImageBaseAddress)
+                    if mainImageEndAddress > mainImageBaseAddress {
+                        safeWrite(fd, "END:")
+                        safeWriteHexUInt(fd, mainImageEndAddress)
+                    }
+                    safeWrite(fd, "SLIDE:")
+                    safeWriteHexUInt(fd, mainImageSlide)
+                }
                 
                 // Write call stack backtrace to tombstone file descriptor using async-signal-safe formatting
                 safeWrite(fd, "STACK:\n")
@@ -433,6 +526,66 @@ public final class Wappn: @unchecked Sendable {
         Darwin.raise(sig)
     }
 
+    /// Caches the main executable's Mach-O load address, slide, name, and UUID at startup
+    /// so `handleSignal` can write them without calling non-async-signal-safe dyld APIs.
+    private static func cacheMainImageMetadata() {
+        #if canImport(Darwin)
+        guard let header = _dyld_get_image_header(0) else { return }
+        mainImageBaseAddress = UInt(bitPattern: header)
+        mainImageSlide = UInt(bitPattern: Int(_dyld_get_image_vmaddr_slide(0)))
+        
+        if let existingName = mainImageNamePointer {
+            free(existingName)
+            mainImageNamePointer = nil
+        }
+        if let namePtr = _dyld_get_image_name(0) {
+            let fullName = String(cString: namePtr)
+            let binaryName = (fullName as NSString).lastPathComponent
+            mainImageNamePointer = strdup(binaryName)
+        }
+        
+        if let existingUUID = mainImageUUIDPointer {
+            free(existingUUID)
+            mainImageUUIDPointer = nil
+        }
+        let details = extractImageDetails(from: header)
+        mainImageEndAddress = details.textVMSize > 0 ? mainImageBaseAddress &+ details.textVMSize : 0
+        if let uuidString = details.uuid {
+            mainImageUUIDPointer = strdup(uuidString)
+        }
+        #endif
+    }
+    
+    #if canImport(Darwin)
+    private static func extractImageDetails(from header: UnsafePointer<mach_header>) -> (uuid: String?, textVMSize: UInt) {
+        guard header.pointee.magic == MH_MAGIC_64 else { return (nil, 0) }
+        let header64 = UnsafeRawPointer(header).assumingMemoryBound(to: mach_header_64.self)
+        var cmdPtr = UnsafeRawPointer(header).advanced(by: MemoryLayout<mach_header_64>.size)
+        var foundUUID: String?
+        var textVMSize: UInt = 0
+        
+        for _ in 0..<header64.pointee.ncmds {
+            let cmd = cmdPtr.assumingMemoryBound(to: load_command.self).pointee
+            guard cmd.cmdsize >= MemoryLayout<load_command>.size else { break }
+            if cmd.cmd == LC_UUID {
+                let uuidCmd = cmdPtr.assumingMemoryBound(to: uuid_command.self).pointee
+                foundUUID = UUID(uuid: uuidCmd.uuid).uuidString
+            } else if cmd.cmd == LC_SEGMENT_64 {
+                let segCmd = cmdPtr.assumingMemoryBound(to: segment_command_64.self).pointee
+                let isText = withUnsafeBytes(of: segCmd.segname) { raw -> Bool in
+                    guard let ptr = raw.baseAddress?.assumingMemoryBound(to: CChar.self) else { return false }
+                    return strcmp(ptr, "__TEXT") == 0
+                }
+                if isText {
+                    textVMSize = UInt(segCmd.vmsize)
+                }
+            }
+            cmdPtr = cmdPtr.advanced(by: Int(cmd.cmdsize))
+        }
+        return (foundUUID, textVMSize)
+    }
+    #endif
+
     /// Async-signal-safe write using static string literals in read-only memory.
     private static func safeWrite(_ fd: Int32, _ string: StaticString) {
         string.withUTF8Buffer { buffer in
@@ -442,11 +595,60 @@ public final class Wappn: @unchecked Sendable {
         }
     }
 
+    /// Async-signal-safe write of a pre-allocated C string pointer.
+    @inline(__always)
+    private static func safeWriteCString(_ fd: Int32, _ pointer: UnsafePointer<CChar>) {
+        var length = 0
+        while pointer[length] != 0 {
+            length += 1
+        }
+        if length > 0 {
+            _ = write(fd, pointer, length)
+        }
+    }
+
+    /// Async-signal-safe write of an unsigned integer in decimal format.
+    @inline(__always)
+    private static func safeWriteDecimalUInt(_ fd: Int32, _ input: UInt) {
+        var value = input
+        var buffer: (UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8,
+                     UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8,
+                     UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8) = (
+            0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0
+        )
+        withUnsafeMutableBytes(of: &buffer) { rawBuf in
+            var pos = 23
+            if value == 0 {
+                rawBuf[pos] = UInt8(ascii: "0")
+                pos -= 1
+            } else {
+                while value > 0 && pos >= 0 {
+                    rawBuf[pos] = UInt8(ascii: "0") + UInt8(value % 10)
+                    value /= 10
+                    pos -= 1
+                }
+            }
+            let start = pos + 1
+            let length = 24 - start
+            if let base = rawBuf.baseAddress {
+                _ = write(fd, base.advanced(by: start), length)
+            }
+        }
+    }
+
     /// Async-signal-safe write of a pointer address in hex format ("0x..." + "\n").
-    /// Operates entirely on stack memory without dynamic allocation or runtime locks.
     @inline(__always)
     private static func safeWritePointer(_ fd: Int32, _ pointer: UnsafeMutableRawPointer) {
-        var value = UInt(bitPattern: pointer)
+        safeWriteHexUInt(fd, UInt(bitPattern: pointer))
+    }
+
+    /// Async-signal-safe write of an unsigned integer in hex format ("0x..." + "\n").
+    /// Operates entirely on stack memory without dynamic allocation or runtime locks.
+    @inline(__always)
+    private static func safeWriteHexUInt(_ fd: Int32, _ input: UInt) {
+        var value = input
         // Buffer layout: up to 16 hex digits + "0x" (2) + "\n" (1) = 19 bytes max
         var buffer: (UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8,
                      UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8,
